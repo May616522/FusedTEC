@@ -57,6 +57,12 @@ class GIMInterpolator:
         查询一个时空位置的 GIM TEC,空间双线性插值,时间线性插值
         """
 
+        # IONEX epochs are parsed as timezone-naive UTC datetimes.  Inputs can
+        # be either Jason timestamps without a timezone or ISO-8601 timestamps
+        # from COSMIC (for example, ``2021-02-24T23:59:52Z``).  Convert both to
+        # the same representation before file lookup and datetime arithmetic.
+        target_time = self._normalize_time(target_time)
+
         data = self.load_day(target_time)
         times = data["times"]
         lats = data["lats"]
@@ -130,12 +136,21 @@ class GIMInterpolator:
         """
         将输入经度转换到 GIM 使用的范围。-180-180 -90-90
         """
-        lon_min = np.min(gim_lons)
-        lon_max=np.max(gim_lons)
-        
         "对于jaosn输入数据,精度在0-360，需要进行处理"
-        lon = ((lon + 180) % 360) - 180
+        lon = (float(lon) + 180.0)% 360.0 - 180.0
         return lon
+
+    @staticmethod
+    def _normalize_time(value):
+        
+        """Return a timezone-naive UTC datetime for GIM interpolation."""
+
+        timestamp = pd.Timestamp(value)
+        if pd.isna(timestamp):
+            raise ValueError(f"无效时间: {value!r}")
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+        return timestamp.to_pydatetime(warn=False)
     
     
     def add_gim_to_dataframe(self,df,time_col="datetime",lat_col="lat",lon_col="lon",output_col="gim_vtec"):
@@ -144,8 +159,11 @@ class GIMInterpolator:
         """
 
         df = df.copy()
-        df[time_col] = pd.to_datetime( df[time_col])
-        df[output_col] = [self.query(t.to_pydatetime(),float(lat),float(lon))
+        # utc=True accepts both Jason's timezone-naive timestamps and COSMIC's
+        # trailing-Z timestamps.  Removing the timezone afterwards matches the
+        # timezone-naive UTC epochs read from IONEX files.
+        df[time_col] = pd.to_datetime(df[time_col], utc=True).dt.tz_localize(None)
+        df[output_col] = [self.query(t,float(lat),float(lon))
             for t, lat, lon in zip(
                 df[time_col],
                 df[lat_col],

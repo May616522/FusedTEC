@@ -35,7 +35,8 @@ class JasonConfig:
     iono_max: float = 0.04
     range_num_min: int = 10
     range_rms_max: float = 0.2
-    
+    downsample_window: str = "10s"  # 降采样时间窗口
+    min_points_per_window: int = 5  # 10s窗口内最少有效点数（少于此值丢弃）
     mask_path: str = r"F:\bs\landmask_2021_10_12\landmask_static.nc"
 
 # 1.读取文件
@@ -144,6 +145,69 @@ def calculate_TEC(df,cfg):
     df = df[(df["TEC_raw"] != 0) & (df["TEC_smooth"] != 0)]
     return df
 
+def downsample_10s(df, cfg):
+    """按10秒间隔对轨迹数据进行降采样与均值平滑处理
+
+    - 解决不连续：设置 min_points_per_window 过滤残缺窗口
+    - 解决经度跨越：采用角度循环均值 (Circular Mean)
+    - 解决空间坐标变化：采用窗口内实际点的均值时刻与算术平均位置
+    """
+    if df.empty:
+        return df
+
+    # 预先计算经度的 sin/cos 用于向量化循环均值计算
+    rad = np.radians(df["lon"])
+    df["_lon_sin"] = np.sin(rad)
+    df["_lon_cos"] = np.cos(rad)
+
+    # 创建时间窗口分组器
+    grouper = pd.Grouper(key="datetime", freq=cfg.downsample_window)
+
+    # 统计每个窗口内的有效点数，筛选满足要求的窗口
+    counts = df.groupby(grouper)["datetime"].count()
+    valid_bins = counts[counts >= cfg.min_points_per_window].index
+
+    if valid_bins.empty:
+        # 临时列清理后返回空表
+        df.drop(columns=["_lon_sin", "_lon_cos"], inplace=True)
+        return pd.DataFrame(columns=df.columns)
+
+    # 向量化聚合计算
+    agg_dict = {
+        "datetime": "mean",  # 实际观测点的时间质心
+        "lat": "mean",  # 纬度算术平均
+        "_lon_sin": "mean",
+        "_lon_cos": "mean",
+        "alt": "mean",  # 高度算术平均
+        "TEC_raw": "mean",  # TEC算术平均
+        "TEC_smooth": "mean",
+        "ice": "max",  # 保守策略：10s内有冰即标记
+        "rain": "max",  # 保守策略：10s内有雨即标记
+    }
+
+    res_df = df.groupby(grouper).agg(agg_dict).loc[valid_bins]
+
+    # 还原经度（角度）并确保在 [0, 360) 范围内
+    res_df["lon"] = (
+        np.degrees(np.arctan2(res_df["_lon_sin"], res_df["_lon_cos"])) + 360
+    ) % 360
+
+    # 清理临时列与重置索引
+    df.drop(columns=["_lon_sin", "_lon_cos"], inplace=True)
+    res_df["lon"] = np.degrees(np.arctan2(res_df["_lon_sin"], res_df["_lon_cos"]))
+
+    save_cols = [
+        "datetime",
+        "lat",
+        "lon",
+        "TEC_raw",
+        "TEC_smooth",
+        "alt",
+        "ice",
+        "rain",
+    ]
+    return res_df[save_cols]
+
 def get_nc_files(input_dir):
     """
     获取文件夹下所有nc文件
@@ -164,6 +228,10 @@ def process_jason(file_path,mask_ds,cfg=None):
     print("QC data nums:%d\n",len(df))
     df=calculate_TEC(df,cfg)
     print("cal data nums:%d\n",len(df))
+    
+    #新增10s降采样
+    df=downsample_10s(df,cfg)
+    print(f"Downsampled 10s data nums: {len(df)}")
     return df
 
 def batch_process_jason(input_dir,output_dir):
@@ -214,10 +282,9 @@ def batch_process_jason(input_dir,output_dir):
 if __name__ == "__main__":
 
 
-    input_dir = r"F:\FusedTec\Data\Jason2020"
-    output_dir = r"F:\FusedTec\Data\Jason2020\TecCSV"
+    input_dir = r"F:\FusedTec\Data\Jason2021"
+    output_dir = r"F:\FusedTec\Data\Jason2021\TecCSV2"
     batch_process_jason(
         input_dir,
         output_dir
     )
-
