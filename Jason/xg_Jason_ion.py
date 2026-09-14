@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tune and train the Jason ionospheric-residual XGBoost model.
 
-The cleaned observations are split once into train/validation/test sets using
-a reproducible 7:1:2 ratio. Optuna sees only the training and validation sets;
-the test set remains untouched until the selected model is evaluated.
+The cleaned observations are split by temporal order into train/validation/test
+sets using a 7:1:2 ratio. The training set comprises the earliest 70% of data,
+validation set the middle 10%, and test set the most recent 20% (approximately
+the last month). Optuna sees only the training and validation sets; the test set
+remains untouched until the selected model is evaluated.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ import pandas as pd
 import xgboost as xgb
 from optuna.samplers import TPESampler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 
 
 TARGET_COLUMN = "residual"
@@ -38,6 +39,7 @@ EXCLUDED_COLUMNS = {
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数，包括输入/输出目录、Optuna试验数量、XGBoost参数范围等。"""
     parser = argparse.ArgumentParser(
         description="Optuna-tuned XGBoost regression for Jason residuals (7:1:2)."
     )
@@ -70,10 +72,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def log(message: str) -> None:
+    """打印带时间戳的日志信息。"""
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), message, flush=True)
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    """验证命令行参数的有效性，确保数值范围合理。"""
     if args.n_trials < 1:
         raise ValueError("--n-trials must be at least 1")
     if args.optuna_timeout < 0:
@@ -87,6 +91,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def find_csv_files(input_dir: Path, pattern: str, recursive: bool) -> list[Path]:
+    """在指定目录中查找匹配模式的CSV文件。"""
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
     iterator = input_dir.rglob(pattern) if recursive else input_dir.glob(pattern)
@@ -97,7 +102,7 @@ def find_csv_files(input_dir: Path, pattern: str, recursive: bool) -> list[Path]
 
 
 def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.DataFrame:
-    """Read many small CSVs in batches and retain compact source identities."""
+    """批量读取多个CSV文件并整合为单个DataFrame，保留数据源信息。"""
     batches: list[pd.DataFrame] = []
     current: list[pd.DataFrame] = []
     expected_columns: list[str] | None = None
@@ -129,6 +134,7 @@ def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.Da
 def clean_and_validate(
     data: pd.DataFrame, requested_altitude: float | None
 ) -> tuple[pd.DataFrame, list[str], float, dict[str, float]]:
+    """清理数据（去除缺失值和异常值），验证数据完整性，固定高度值。"""
     required = {TARGET_COLUMN, "datetime", "lat", "lon", "alt"}
     missing = sorted(required.difference(data.columns))
     if missing:
@@ -172,27 +178,47 @@ def clean_and_validate(
     return data, feature_columns, fixed_altitude, original_altitude
 
 
-def split_indices(row_count: int, seed: int) -> dict[str, np.ndarray]:
-    """Return disjoint random indices in a 70%/10%/20% design."""
-    all_indices = np.arange(row_count)
-    train_val, test = train_test_split(
-        all_indices, test_size=0.2, random_state=seed, shuffle=True
-    )
-    train, validation = train_test_split(
-        train_val, test_size=0.125, random_state=seed, shuffle=True
-    )
-    splits = {"train": train, "validation": validation, "test": test}
+def split_by_time_period(data: pd.DataFrame) -> dict[str, np.ndarray]:
+    """按时间顺序划分数据集：前70%训练、中间10%验证、后20%测试（最后一个时间段）。"""
+    # 确保数据按时间排序
+    sorted_data = data.sort_values("datetime").reset_index(drop=True)
+    total = len(sorted_data)
+    
+    # 按时间比例划分
+    train_idx = int(0.7 * total)
+    val_idx = int(0.8 * total)
+    
+    splits = {
+        "train": np.arange(0, train_idx),
+        "validation": np.arange(train_idx, val_idx),
+        "test": np.arange(val_idx, total)
+    }
+    
     log(
-        "Dataset split: "
+        "Dataset split (time-based): "
         + ", ".join(
-            f"{name}={len(index):,} ({len(index) / row_count:.2%})"
+            f"{name}={len(index):,} ({len(index) / total:.2%})"
             for name, index in splits.items()
         )
     )
+    
+    # 打印时间范围
+    date_train_start = sorted_data.iloc[splits["train"][0]]["datetime"]
+    date_train_end = sorted_data.iloc[splits["train"][-1]]["datetime"]
+    date_val_start = sorted_data.iloc[splits["validation"][0]]["datetime"]
+    date_val_end = sorted_data.iloc[splits["validation"][-1]]["datetime"]
+    date_test_start = sorted_data.iloc[splits["test"][0]]["datetime"]
+    date_test_end = sorted_data.iloc[splits["test"][-1]]["datetime"]
+    
+    log(f"Train period: {date_train_start} to {date_train_end}")
+    log(f"Validation period: {date_val_start} to {date_val_end}")
+    log(f"Test period: {date_test_start} to {date_test_end}")
+    
     return splits
 
 
 def base_parameters(args: argparse.Namespace) -> dict[str, object]:
+    """生成XGBoost模型的基础参数配置。"""
     return {
         "objective": "reg:squarederror", "eval_metric": "rmse",
         "booster": "gbtree", "tree_method": "hist",
@@ -204,7 +230,7 @@ def fit_with_early_stopping(
     params: dict[str, object], x_train: np.ndarray, y_train: np.ndarray,
     x_validation: np.ndarray, y_validation: np.ndarray, rounds: int,
 ) -> xgb.XGBRegressor:
-    """Fit across both old and new XGBoost sklearn APIs."""
+    """使用早停策略训练XGBoost回归模型，兼容不同版本的XGBoost API。"""
     eval_set = [(x_train, y_train), (x_validation, y_validation)]
     if rounds == 0:
         model = xgb.XGBRegressor(**params)
@@ -227,6 +253,7 @@ def optimize_parameters(
     args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarray,
     x_validation: np.ndarray, y_validation: np.ndarray,
 ) -> optuna.Study:
+    """使用Optuna框架进行XGBoost超参数调优，通过验证集RMSE最小化。"""
     fixed = base_parameters(args)
 
     def objective(trial: optuna.Trial) -> float:
@@ -282,6 +309,7 @@ def optimize_parameters(
 
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """计算回归模型的评估指标（RMSE、MAE、R2、平均误差、误差标准差）。"""
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "mae": float(mean_absolute_error(y_true, y_pred)),
@@ -294,6 +322,7 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
 def save_training_history(
     model: xgb.XGBRegressor, output_dir: Path
 ) -> dict[str, list[float]]:
+    """提取模型训练历史，保存为CSV文件并绘制损失曲线图表。"""
     raw = model.evals_result()
     history = {
         "train_rmse": [float(value) for value in raw["validation_0"]["rmse"]],
@@ -324,6 +353,7 @@ def save_training_history(
 
 
 def select_plot_indices(length: int, maximum: int, seed: int) -> np.ndarray:
+    """从数据中随机选择用于绘图的点的索引，避免绘图点过多。"""
     if maximum <= 0 or length <= maximum:
         return np.arange(length)
     return np.sort(np.random.default_rng(seed).choice(length, maximum, replace=False))
@@ -333,6 +363,7 @@ def save_test_figure(
     y_true: np.ndarray, y_pred: np.ndarray, output_path: Path,
     maximum_points: int, seed: int,
 ) -> None:
+    """绘制测试集的预测性能图表，包括预测值vs真实值散点图和误差分布直方图。"""
     plot_idx = select_plot_indices(len(y_true), maximum_points, seed)
     errors = y_pred - y_true
     metrics = regression_metrics(y_true, y_pred)
@@ -360,6 +391,7 @@ def save_test_figure(
 def save_feature_importance(
     model: xgb.XGBRegressor, feature_columns: list[str], output_dir: Path
 ) -> None:
+    """计算并保存特征重要性，输出完整排序表和Top15特征的柱状图。"""
     importance = pd.DataFrame({
         "feature": feature_columns, "gain_importance": model.feature_importances_,
     }).sort_values("gain_importance", ascending=False)
@@ -376,6 +408,7 @@ def save_feature_importance(
 
 
 def save_eda_figures(data: pd.DataFrame, output_dir: Path) -> None:
+    """生成并保存探索性数据分析图表，包括直方图和相关性矩阵。"""
     numeric_data = data.select_dtypes(include=[np.number]).drop(
         columns=[SOURCE_FILE_COLUMN], errors="ignore"
     )
@@ -399,6 +432,7 @@ def save_eda_figures(data: pd.DataFrame, output_dir: Path) -> None:
 
 
 def main() -> int:
+    """主函数：完整执行数据处理、模型优化、训练、评估和结果保存的整个流程。"""
     args = parse_args()
     validate_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -413,9 +447,13 @@ def main() -> int:
     if args.save_eda:
         save_eda_figures(data, args.output_dir)
 
-    indices = split_indices(len(data), args.model_seed)
-    x_values = data[feature_columns].to_numpy(dtype=np.float32)
-    y_values = data[TARGET_COLUMN].to_numpy(dtype=np.float32)
+    indices = split_by_time_period(data)
+    # 按时间排序数据以匹配索引，保存原始行号映射
+    data_sorted = data.sort_values("datetime").reset_index(drop=False)
+    original_indices = data_sorted["index"].values
+    data_sorted = data_sorted.reset_index(drop=True)
+    x_values = data_sorted[feature_columns].to_numpy(dtype=np.float32)
+    y_values = data_sorted[TARGET_COLUMN].to_numpy(dtype=np.float32)
     x_train, y_train = x_values[indices["train"]], y_values[indices["train"]]
     x_validation, y_validation = (
         x_values[indices["validation"]], y_values[indices["validation"]]
@@ -449,7 +487,7 @@ def main() -> int:
 
     test_index = indices["test"]
     pd.DataFrame({
-        "original_row_index": test_index,
+        "original_row_index": original_indices[test_index],
         "true_residual": y_values[test_index],
         "predicted_residual": predictions["test"],
         "prediction_error": predictions["test"] - y_values[test_index],
@@ -464,9 +502,24 @@ def main() -> int:
         "input_directory": str(args.input_dir.resolve()),
         "input_file_count": len(files),
         "valid_row_count": len(data),
+        "split_method": "time-based (chronological order)",
         "split_ratio": {"train": 0.7, "validation": 0.1, "test": 0.2},
         "split_rows": {name: len(value) for name, value in indices.items()},
-        "random_seed": args.model_seed,
+        "time_periods": {
+            "train": {
+                "start": str(data_sorted.iloc[indices["train"][0]]["datetime"]),
+                "end": str(data_sorted.iloc[indices["train"][-1]]["datetime"])
+            },
+            "validation": {
+                "start": str(data_sorted.iloc[indices["validation"][0]]["datetime"]),
+                "end": str(data_sorted.iloc[indices["validation"][-1]]["datetime"])
+            },
+            "test": {
+                "start": str(data_sorted.iloc[indices["test"][0]]["datetime"]),
+                "end": str(data_sorted.iloc[indices["test"][-1]]["datetime"])
+            }
+        },
+        "model_seed": args.model_seed,
         "feature_columns": feature_columns,
         "fixed_altitude": fixed_altitude,
         "original_altitude": original_altitude,

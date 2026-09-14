@@ -9,6 +9,9 @@
 #SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/jason2021/xg_jason_ion_%j.err
 
 # Slurm job file for xg_Jason_ion.py.
+# Trains an XGBoost model for Jason ionospheric residuals using time-based 
+# (chronological) data splitting: earliest 70% for training, next 10% for 
+# validation, and most recent 20% (approximately last month) for testing.
 # If your cluster requires them, also add its #SBATCH --partition and
 # #SBATCH --account lines above. Resource limits (CPU, memory, time) should be
 # adjusted to the rules of your cluster.
@@ -35,6 +38,14 @@ MIN_ESTIMATORS="200"
 MAX_ESTIMATORS="2000"
 EARLY_STOPPING_ROUNDS="100"
 MODEL_SEED="42"
+
+# Optional parameters (commented out by default):
+# --pattern: File pattern to match (default: "*.csv")
+# --recursive: Search recursively in subdirectories (add flag to enable)
+# --csv-engine: CSV reading engine, one of: c, python, pyarrow (default: c)
+# --read-batch-size: Number of CSV files to read in batch (default: 250)
+# --max-scatter-points: Max points to plot in test figures (default: 200000)
+# --save-eda: Generate exploratory data analysis plots (add flag to enable)
 
 # Directly use the Python executable in LiuQingyuan's Conda environment. This
 # is more reliable than `conda activate` in a non-interactive Slurm job.
@@ -75,7 +86,7 @@ echo "Input: ${INPUT_DIR}"
 echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
 echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
-echo "Dataset split: train/validation/test = 7/1/2"
+echo "Dataset split: time-based (chronological), train/validation/test = 7/1/2"
 
 srun "${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --input-dir "${INPUT_DIR}" \
