@@ -39,7 +39,6 @@ MIN_ESTIMATORS="200"
 MAX_ESTIMATORS="2000"
 EARLY_STOPPING_ROUNDS="100"
 MODEL_SEED="42"
-OUTLIER_SIGMA="3.0"
 
 # Optional parameters (commented out by default):
 # --pattern: File pattern to match (default: "*.csv")
@@ -48,7 +47,6 @@ OUTLIER_SIGMA="3.0"
 # --read-batch-size: Number of CSV files to read in batch (default: 250)
 # --max-scatter-points: Max points to plot in test figures (default: 200000)
 # --save-eda: Generate exploratory data analysis plots (add flag to enable)
-# --outlier-sigma: Remove residuals outside mean +/- N sigma (set below to 3.0)
 
 # Directly use the Python executable in LiuQingyuan's Conda environment. This
 # is more reliable than `conda activate` in a non-interactive Slurm job.
@@ -91,13 +89,11 @@ echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
 echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
 echo "Dataset split: interleaved DOY modulo 10, train/validation/test = 7/2/1"
 echo "DOY remainders: validation={3,7}, test={0}, training=all others"
-echo "Residual outlier filter: mean +/- ${OUTLIER_SIGMA} sigma"
 
 srun "${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --input-dir "${INPUT_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --fixed-altitude "${FIXED_ALTITUDE}" \
-    --outlier-sigma "${OUTLIER_SIGMA}" \
     --n-trials "${N_TRIALS}" \
     --optuna-timeout "${OPTUNA_TIMEOUT}" \
     --min-estimators "${MIN_ESTIMATORS}" \

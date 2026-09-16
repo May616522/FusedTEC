@@ -70,13 +70,6 @@ def parse_args() -> argparse.Namespace:
         help="Replace alt by this constant; default is the cleaned-data median.",
     )
     parser.add_argument(
-        "--outlier-sigma", type=float, default=3.0,
-        help=(
-            "Remove target rows outside mean +/- N population standard deviations "
-            "after missing-value cleaning; default: 3.0."
-        ),
-    )
-    parser.add_argument(
         "--n-jobs", type=int,
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
     )
@@ -101,8 +94,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Estimator range is invalid")
     if args.early_stopping_rounds < 0:
         raise ValueError("--early-stopping-rounds cannot be negative")
-    if not np.isfinite(args.outlier_sigma) or args.outlier_sigma <= 0:
-        raise ValueError("--outlier-sigma must be a positive finite number")
     if args.n_jobs < 1 or args.read_batch_size < 1:
         raise ValueError("--n-jobs and --read-batch-size must be positive")
 
@@ -149,10 +140,8 @@ def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.Da
 
 
 def clean_and_validate(
-    data: pd.DataFrame, requested_altitude: float | None, outlier_sigma: float
-) -> tuple[
-    pd.DataFrame, list[str], float, dict[str, float], dict[str, float | int]
-]:
+    data: pd.DataFrame, requested_altitude: float | None
+) -> tuple[pd.DataFrame, list[str], float, dict[str, float]]:
     """清理数据（去除缺失值和异常值），验证数据完整性，固定高度值。"""
     required = {TARGET_COLUMN, "datetime", "lat", "lon", "alt"}
     missing = sorted(required.difference(data.columns))
@@ -184,40 +173,6 @@ def clean_and_validate(
     if len(data) < 10:
         raise ValueError(f"Too few valid rows for a 7:2:1 split: {len(data)}")
 
-    # 按全部有效目标值的总体标准差执行双侧 mean +/- N sigma 粗差筛选。
-    rows_before_sigma_filter = len(data)
-    residual_mean = float(data[TARGET_COLUMN].mean())
-    residual_std = float(data[TARGET_COLUMN].std(ddof=0))
-    if not np.isfinite(residual_mean) or not np.isfinite(residual_std):
-        raise ValueError("Residual mean/std is not finite after missing-value cleaning")
-    lower_bound = residual_mean - outlier_sigma * residual_std
-    upper_bound = residual_mean + outlier_sigma * residual_std
-    outlier_mask = ~data[TARGET_COLUMN].between(lower_bound, upper_bound, inclusive="both")
-    removed_outliers = int(outlier_mask.sum())
-    data = data.loc[~outlier_mask].reset_index(drop=True)
-    sigma_filter = {
-        "sigma_multiplier": float(outlier_sigma),
-        "mean": residual_mean,
-        "population_std": residual_std,
-        "lower_bound": float(lower_bound),
-        "upper_bound": float(upper_bound),
-        "rows_before": rows_before_sigma_filter,
-        "rows_removed": removed_outliers,
-        "removed_ratio": removed_outliers / rows_before_sigma_filter,
-        "rows_retained": len(data),
-    }
-    log(
-        f"Residual {outlier_sigma:g}-sigma filter: "
-        f"mean={residual_mean:.6f}, std={residual_std:.6f}, "
-        f"bounds=[{lower_bound:.6f}, {upper_bound:.6f}]"
-    )
-    log(
-        f"Sigma outliers removed: {removed_outliers:,} "
-        f"({removed_outliers / rows_before_sigma_filter:.2%}); retained: {len(data):,}"
-    )
-    if len(data) < 10:
-        raise ValueError(f"Too few rows remain after sigma filtering: {len(data)}")
-
     original_altitude = {
         "minimum": float(data["alt"].min()),
         "median": float(data["alt"].median()),
@@ -234,7 +189,7 @@ def clean_and_validate(
         f"{original_altitude['minimum']:.6f} to {original_altitude['maximum']:.6f}; "
         f"fixed at {fixed_altitude:.6f}"
     )
-    return data, feature_columns, fixed_altitude, original_altitude, sigma_filter
+    return data, feature_columns, fixed_altitude, original_altitude
 
 
 def split_by_day_of_year(data: pd.DataFrame) -> dict[str, np.ndarray]:
@@ -505,8 +460,8 @@ def main() -> int:
     files = find_csv_files(args.input_dir, args.pattern, args.recursive)
     log(f"Found {len(files):,} CSV files")
     data = load_csv_files(files, args.csv_engine, args.read_batch_size)
-    data, feature_columns, fixed_altitude, original_altitude, sigma_filter = clean_and_validate(
-        data, args.fixed_altitude, args.outlier_sigma
+    data, feature_columns, fixed_altitude, original_altitude = clean_and_validate(
+        data, args.fixed_altitude
     )
     log(f"Model features ({len(feature_columns)}): {feature_columns}")
     if args.save_eda:
@@ -567,7 +522,6 @@ def main() -> int:
         "input_directory": str(args.input_dir.resolve()),
         "input_file_count": len(files),
         "valid_row_count": len(data),
-        "residual_sigma_filter": sigma_filter,
         "split_method": "deterministic interleaved day-of-year modulo 10",
         "split_ratio_target": {"train": 0.7, "validation": 0.2, "test": 0.1},
         "split_rule": {
