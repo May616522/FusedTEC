@@ -29,11 +29,8 @@ PYTHON_SCRIPT="${SCRIPT_DIR}/xg_Jason_ion.py"
 # This directory must directly contain the processed CSV files.
 INPUT_DIR="/share/home/u23114/tj23114/data/Yaoyaping_data/jason2021"
 
-# Quick quarter-data diagnostic experiment. Each Slurm job gets an independent
-# directory so an earlier result cannot be overwritten accidentally.
-EXPERIMENT_NAME="quarter_seed42_sigma3"
-RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
+# Results are written beside this job script by default.
+OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results"
 
 # Fixed Jason orbital altitude, in the same unit as the CSV alt column. This
 # is the median of the local 2021 data (original range: 1339.02 to 1356.56).
@@ -46,8 +43,6 @@ MIN_ESTIMATORS="200"
 MAX_ESTIMATORS="2000"
 EARLY_STOPPING_ROUNDS="100"
 MODEL_SEED="42"
-SAMPLE_FRACTION="0.25"
-SAMPLE_SEED="42"
 OUTLIER_SIGMA="3.0"
 
 # Optional parameters (commented out by default):
@@ -58,10 +53,6 @@ OUTLIER_SIGMA="3.0"
 # --max-scatter-points: Max points to plot in test figures (default: 200000)
 # --save-eda: Generate exploratory data analysis plots (add flag to enable)
 # --outlier-sigma: Training-only mean +/- N sigma bounds (set below to 3.0)
-# --sample-fraction: 1.0 restores a full-data run; this experiment uses 0.25
-# --sample-seed: makes the random quarter-data subset reproducible
-# --no-sigma-filter: retain tail targets for an unfiltered comparison experiment
-# --export-extremes: export full records outside the training-derived 3-sigma bounds
 
 # Directly use the Python executable in LiuQingyuan's Conda environment. This
 # is more reliable than `conda activate` in a non-interactive Slurm job.
@@ -102,34 +93,23 @@ echo "Input: ${INPUT_DIR}"
 echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
 echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
-echo "Experiment: ${EXPERIMENT_NAME}"
-echo "Random valid-row sample: ${SAMPLE_FRACTION} (seed=${SAMPLE_SEED})"
 echo "Dataset split: interleaved DOY modulo 10, train/validation/test = 7/2/1"
 echo "DOY remainders: validation={3,7}, test={0}, training=all others"
 echo "Residual outlier filter: training-only mean +/- ${OUTLIER_SIGMA} sigma"
 echo "Test evaluation: full test set plus clean subset; full test is never filtered"
 echo "Additional model feature: gim_vtec"
 
-COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
+srun "${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --input-dir "${INPUT_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --fixed-altitude "${FIXED_ALTITUDE}" \
-    --sample-fraction "${SAMPLE_FRACTION}" \
-    --sample-seed "${SAMPLE_SEED}" \
     --outlier-sigma "${OUTLIER_SIGMA}" \
-    --sigma-filter \
-    --export-extremes \
     --n-trials "${N_TRIALS}" \
     --optuna-timeout "${OPTUNA_TIMEOUT}" \
     --min-estimators "${MIN_ESTIMATORS}" \
     --max-estimators "${MAX_ESTIMATORS}" \
     --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}" \
     --model-seed "${MODEL_SEED}" \
-    --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
-
-printf 'Command:'
-printf ' %q' "${COMMAND[@]}"
-printf '\n'
-srun "${COMMAND[@]}"
+    --n-jobs "${SLURM_CPUS_PER_TASK:-1}"
 
 echo "Training completed successfully."

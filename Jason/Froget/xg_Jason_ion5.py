@@ -19,7 +19,6 @@ import argparse
 import gc
 import json
 import os
-import shlex
 import sys
 import time
 from pathlib import Path
@@ -39,16 +38,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 TARGET_COLUMN = "residual"
 SOURCE_FILE_COLUMN = "__source_file_id"
-SOURCE_ROW_COLUMN = "__source_row_number"
-ORIGINAL_ROW_COLUMN = "__cleaned_row_index"
 SPLIT_MODULUS = 10
 VALIDATION_DOY_REMAINDERS = frozenset({3, 7})
 TEST_DOY_REMAINDERS = frozenset({0})
 EXCLUDED_COLUMNS = {
     "datetime", TARGET_COLUMN, "TEC_smooth", "TEC_raw", SOURCE_FILE_COLUMN,
-    SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN,
 }
-SIGMA_SEGMENTS = ("within_1sigma", "sigma_1_to_2", "sigma_2_to_3", "beyond_3sigma")
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,17 +69,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-rounds", type=int, default=100)
     parser.add_argument("--model-seed", type=int, default=42)
     parser.add_argument(
-        "--sample-fraction", type=float, default=1.0,
-        help=(
-            "Randomly retain this fraction of valid rows before the date split. "
-            "Use 0.25 for a reproducible quarter-data trial; default: 1.0."
-        ),
-    )
-    parser.add_argument(
-        "--sample-seed", type=int, default=42,
-        help="Random seed used only for --sample-fraction; default: 42.",
-    )
-    parser.add_argument(
         "--fixed-altitude", type=float, default=None,
         help="Replace alt by this constant; default is the cleaned-data median.",
     )
@@ -95,20 +79,6 @@ def parse_args() -> argparse.Namespace:
             "using bounds calculated from the training split only. The test split "
             "is not filtered; default: 3.0."
         ),
-    )
-    sigma_group = parser.add_mutually_exclusive_group()
-    sigma_group.add_argument(
-        "--sigma-filter", dest="sigma_filter", action="store_true",
-        help="Filter training and validation targets using training-derived bounds (default).",
-    )
-    sigma_group.add_argument(
-        "--no-sigma-filter", dest="sigma_filter", action="store_false",
-        help="Keep target-tail rows in training and validation; diagnostics are still produced.",
-    )
-    parser.set_defaults(sigma_filter=True)
-    parser.add_argument(
-        "--export-extremes", action="store_true",
-        help="Export all train/validation/test rows beyond the training-derived 3-sigma bounds.",
     )
     parser.add_argument(
         "--n-jobs", type=int,
@@ -137,8 +107,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--early-stopping-rounds cannot be negative")
     if not np.isfinite(args.outlier_sigma) or args.outlier_sigma <= 0:
         raise ValueError("--outlier-sigma must be a positive finite number")
-    if not np.isfinite(args.sample_fraction) or not 0 < args.sample_fraction <= 1:
-        raise ValueError("--sample-fraction must be in the interval (0, 1]")
     if args.n_jobs < 1 or args.read_batch_size < 1:
         raise ValueError("--n-jobs and --read-batch-size must be positive")
 
@@ -170,7 +138,6 @@ def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.Da
                 f"first file={expected_columns}; {path}={columns}"
             )
         frame[SOURCE_FILE_COLUMN] = number - 1
-        frame[SOURCE_ROW_COLUMN] = np.arange(len(frame), dtype=np.int64)
         current.append(frame)
         if len(current) >= batch_size:
             batches.append(pd.concat(current, ignore_index=True))
@@ -183,33 +150,6 @@ def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.Da
     del batches
     gc.collect()
     return data
-
-
-def sample_valid_rows(
-    data: pd.DataFrame, fraction: float, seed: int
-) -> tuple[pd.DataFrame, dict[str, object]]:
-    """在日期划分前对有效记录做可复现的全局随机抽样。"""
-    rows_before = len(data)
-    if fraction == 1.0:
-        sampled = data.copy()
-    else:
-        sample_size = max(10, int(round(rows_before * fraction)))
-        sample_size = min(sample_size, rows_before)
-        sampled = data.sample(n=sample_size, replace=False, random_state=seed)
-    sampled = sampled.reset_index(drop=True)
-    summary = {
-        "requested_fraction": float(fraction),
-        "seed": int(seed),
-        "rows_before_sampling": int(rows_before),
-        "rows_after_sampling": int(len(sampled)),
-        "realized_fraction": float(len(sampled) / rows_before),
-        "stage": "after validation/NA removal and before deterministic date split",
-    }
-    log(
-        f"Random sampling: retained {len(sampled):,}/{rows_before:,} valid rows "
-        f"({len(sampled) / rows_before:.2%}), seed={seed}"
-    )
-    return sampled, summary
 
 
 def clean_and_validate(
@@ -245,7 +185,6 @@ def clean_and_validate(
     log(f"Rows removed: {rows_before - len(data):,}; retained: {len(data):,}")
     if len(data) < 10:
         raise ValueError(f"Too few valid rows for a 7:2:1 split: {len(data)}")
-    data[ORIGINAL_ROW_COLUMN] = np.arange(len(data), dtype=np.int64)
 
     original_altitude = {
         "minimum": float(data["alt"].min()),
@@ -267,15 +206,14 @@ def clean_and_validate(
 
 
 def build_sigma_filtered_splits(
-    data: pd.DataFrame, splits: dict[str, np.ndarray], outlier_sigma: float,
-    apply_filter: bool,
+    data: pd.DataFrame, splits: dict[str, np.ndarray], outlier_sigma: float
 ) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, object]]:
     """仅用训练集计算 residual 阈值，过滤训练/验证并标记测试 clean 子集。"""
     train_residual = data.iloc[splits["train"]][TARGET_COLUMN].to_numpy()
     residual_mean = float(np.mean(train_residual))
     residual_std = float(np.std(train_residual, ddof=0))
-    if not np.isfinite(residual_mean) or not np.isfinite(residual_std) or residual_std <= 0:
-        raise ValueError("Training residual mean/std is not finite or std is zero")
+    if not np.isfinite(residual_mean) or not np.isfinite(residual_std):
+        raise ValueError("Training residual mean/std is not finite")
 
     lower_bound = residual_mean - outlier_sigma * residual_std
     upper_bound = residual_mean + outlier_sigma * residual_std
@@ -283,14 +221,8 @@ def build_sigma_filtered_splits(
     clean_mask = (residual >= lower_bound) & (residual <= upper_bound)
 
     filtered_splits = {
-        "train": (
-            splits["train"][clean_mask[splits["train"]]]
-            if apply_filter else splits["train"]
-        ),
-        "validation": (
-            splits["validation"][clean_mask[splits["validation"]]]
-            if apply_filter else splits["validation"]
-        ),
+        "train": splits["train"][clean_mask[splits["train"]]],
+        "validation": splits["validation"][clean_mask[splits["validation"]]],
         # 测试集保持完整，不参与 residual 筛选。
         "test": splits["test"],
     }
@@ -310,11 +242,7 @@ def build_sigma_filtered_splits(
             "rows_outside_bounds": total - retained,
             "within_bounds_ratio": retained / total,
         }
-        action = (
-            "retained without filtering"
-            if name == "test" or not apply_filter
-            else "within bounds and retained for modeling"
-        )
+        action = "retained without filtering" if name == "test" else "retained for modeling"
         log(
             f"{name} sigma summary: {retained:,}/{total:,} within bounds; "
             f"{action}"
@@ -327,17 +255,9 @@ def build_sigma_filtered_splits(
         "population_std": residual_std,
         "lower_bound": float(lower_bound),
         "upper_bound": float(upper_bound),
-        "diagnostic_bounds": {
-            f"{level}_sigma": {
-                "lower": float(residual_mean - level * residual_std),
-                "upper": float(residual_mean + level * residual_std),
-            }
-            for level in (1, 2, 3)
-        },
-        "filter_enabled": bool(apply_filter),
         "application": {
-            "train": "filtered" if apply_filter else "not filtered",
-            "validation": "filtered" if apply_filter else "not filtered",
+            "train": "filtered",
+            "validation": "filtered",
             "test": "not filtered; clean subset only marked for additional evaluation",
         },
         "splits": split_summary,
@@ -488,226 +408,13 @@ def optimize_parameters(
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     """计算回归模型的评估指标（RMSE、MAE、R2、平均误差、误差标准差）。"""
-    r2 = float("nan")
-    if len(y_true) >= 2 and not np.isclose(np.var(y_true), 0.0):
-        r2 = float(r2_score(y_true, y_pred))
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "mae": float(mean_absolute_error(y_true, y_pred)),
-        "r2": r2,
+        "r2": float(r2_score(y_true, y_pred)),
         "mean_error": float(np.mean(y_pred - y_true)),
         "error_std": float(np.std(y_pred - y_true)),
     }
-
-
-def sigma_segment_labels(z_score: np.ndarray) -> np.ndarray:
-    """按绝对训练 z-score 生成四个互斥的 sigma 分段标签。"""
-    absolute = np.abs(z_score)
-    return np.select(
-        [absolute <= 1, absolute <= 2, absolute <= 3],
-        SIGMA_SEGMENTS[:3], default=SIGMA_SEGMENTS[3],
-    )
-
-
-def _distribution_statistics(prefix: str, values: np.ndarray) -> dict[str, float]:
-    quantiles = np.quantile(values, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
-    result = {
-        f"{prefix}_min": float(np.min(values)),
-        f"{prefix}_max": float(np.max(values)),
-        f"{prefix}_mean": float(np.mean(values)),
-        f"{prefix}_std": float(np.std(values)),
-    }
-    for label, value in zip(("p01", "p05", "p25", "p50", "p75", "p95", "p99"), quantiles):
-        result[f"{prefix}_{label}"] = float(value)
-    return result
-
-
-def build_sigma_diagnostics(
-    raw_indices: dict[str, np.ndarray], y_values: np.ndarray,
-    raw_predictions: dict[str, np.ndarray], residual_mean: float, residual_std: float,
-) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """生成 train/validation/test 在互斥 sigma 区间上的长表诊断。"""
-    rows: list[dict[str, object]] = []
-    labels_by_split: dict[str, np.ndarray] = {}
-    z_scores_by_split: dict[str, np.ndarray] = {}
-    for split_name, split_index in raw_indices.items():
-        true = y_values[split_index]
-        predicted = raw_predictions[split_name]
-        z_score = (true - residual_mean) / residual_std
-        labels = sigma_segment_labels(z_score)
-        labels_by_split[split_name] = labels
-        z_scores_by_split[split_name] = z_score
-        for segment in SIGMA_SEGMENTS:
-            mask = labels == segment
-            count = int(mask.sum())
-            row: dict[str, object] = {
-                "split": split_name,
-                "segment": segment,
-                "n_samples": count,
-                "sample_ratio": count / len(split_index),
-            }
-            if count:
-                true_segment = true[mask]
-                pred_segment = predicted[mask]
-                row.update(regression_metrics(true_segment, pred_segment))
-                row.update(_distribution_statistics("true", true_segment))
-                row.update(_distribution_statistics("pred", pred_segment))
-                true_std = float(np.std(true_segment))
-                pred_std = float(np.std(pred_segment))
-                row["compression_ratio"] = (
-                    pred_std / true_std if not np.isclose(true_std, 0.0) else float("nan")
-                )
-                row["fit_slope"] = (
-                    float(np.polyfit(true_segment, pred_segment, 1)[0])
-                    if count >= 2 and not np.isclose(true_std, 0.0)
-                    else float("nan")
-                )
-            else:
-                for column in (
-                    "rmse", "mae", "r2", "mean_error", "error_std",
-                    "true_min", "true_max", "true_mean", "true_std",
-                    "true_p01", "true_p05", "true_p25", "true_p50", "true_p75",
-                    "true_p95", "true_p99", "pred_min", "pred_max", "pred_mean",
-                    "pred_std", "pred_p01", "pred_p05", "pred_p25", "pred_p50",
-                    "pred_p75", "pred_p95", "pred_p99", "compression_ratio", "fit_slope",
-                ):
-                    row[column] = float("nan")
-            rows.append(row)
-    return pd.DataFrame(rows), labels_by_split, z_scores_by_split
-
-
-def save_sigma_diagnostic_figures(
-    diagnostics: pd.DataFrame, raw_indices: dict[str, np.ndarray],
-    y_values: np.ndarray, raw_predictions: dict[str, np.ndarray],
-    labels_by_split: dict[str, np.ndarray], z_scores_by_split: dict[str, np.ndarray],
-    output_dir: Path, maximum_points: int, seed: int,
-) -> None:
-    """保存 sigma 分段误差、散点、z-score误差和目标分布诊断图。"""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    x = np.arange(len(SIGMA_SEGMENTS))
-    width = 0.25
-    for offset, split_name in enumerate(("train", "validation", "test")):
-        subset = diagnostics.loc[diagnostics["split"] == split_name].set_index("segment")
-        for axis, metric in zip(axes, ("rmse", "mae")):
-            axis.bar(x + (offset - 1) * width, subset.loc[list(SIGMA_SEGMENTS), metric], width, label=split_name)
-    for axis, metric in zip(axes, ("RMSE", "MAE")):
-        axis.set_xticks(x, ("<=1σ", "1–2σ", "2–3σ", ">3σ"))
-        axis.set_ylabel(metric)
-        axis.grid(True, axis="y", linestyle="--", alpha=0.35)
-        axis.legend()
-    fig.suptitle("Error by mutually exclusive training-derived sigma segment")
-    fig.tight_layout()
-    fig.savefig(output_dir / "sigma_segment_metrics.png", dpi=200)
-    plt.close(fig)
-
-    for split_number, split_name in enumerate(("train", "validation", "test")):
-        split_index = raw_indices[split_name]
-        true = y_values[split_index]
-        predicted = raw_predictions[split_name]
-        labels = labels_by_split[split_name]
-        limits = [float(min(true.min(), predicted.min())), float(max(true.max(), predicted.max()))]
-        fig, axes = plt.subplots(2, 2, figsize=(11, 10), sharex=True, sharey=True)
-        for segment_number, (axis, segment) in enumerate(zip(axes.ravel(), SIGMA_SEGMENTS)):
-            positions = np.flatnonzero(labels == segment)
-            chosen = select_plot_indices(
-                len(positions), maximum_points // 4 if maximum_points > 0 else 0,
-                seed + split_number * 10 + segment_number,
-            )
-            positions = positions[chosen]
-            axis.scatter(true[positions], predicted[positions], s=8, alpha=0.25)
-            axis.plot(limits, limits, "r--", lw=1.2)
-            axis.set_title(f"{segment} (n={int((labels == segment).sum()):,})")
-            axis.grid(True, linestyle="--", alpha=0.3)
-        fig.supxlabel("True residual")
-        fig.supylabel("Predicted residual")
-        fig.suptitle(f"{split_name}: true vs predicted by sigma segment")
-        fig.tight_layout()
-        fig.savefig(output_dir / f"{split_name}_sigma_segment_scatter.png", dpi=200)
-        plt.close(fig)
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
-    for split_number, (axis, split_name) in enumerate(zip(axes, ("train", "validation", "test"))):
-        true = y_values[raw_indices[split_name]]
-        error = np.abs(raw_predictions[split_name] - true)
-        chosen = select_plot_indices(len(true), maximum_points, seed + 100 + split_number)
-        axis.scatter(z_scores_by_split[split_name][chosen], error[chosen], s=6, alpha=0.2)
-        axis.axvline(-3, color="red", linestyle="--", lw=1)
-        axis.axvline(3, color="red", linestyle="--", lw=1)
-        axis.set_title(split_name)
-        axis.set_xlabel("Residual z-score (training statistics)")
-        axis.grid(True, linestyle="--", alpha=0.3)
-    axes[0].set_ylabel("Absolute prediction error")
-    fig.tight_layout()
-    fig.savefig(output_dir / "z_score_vs_absolute_error.png", dpi=200)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for split_name in ("train", "validation", "test"):
-        ax.hist(
-            y_values[raw_indices[split_name]], bins=80, density=True,
-            histtype="step", linewidth=1.5, label=split_name,
-        )
-    ax.set_xlabel("True residual")
-    ax.set_ylabel("Density")
-    ax.set_title("Target distribution by split")
-    ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_dir / "target_distribution_by_split.png", dpi=200)
-    plt.close(fig)
-
-    test_true = y_values[raw_indices["test"]]
-    test_predicted = raw_predictions["test"]
-    shared_range = (
-        float(min(test_true.min(), test_predicted.min())),
-        float(max(test_true.max(), test_predicted.max())),
-    )
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.hist(
-        test_true, bins=80, range=shared_range, density=True,
-        histtype="step", linewidth=1.6, label="true residual",
-    )
-    ax.hist(
-        test_predicted, bins=80, range=shared_range, density=True,
-        histtype="step", linewidth=1.6, label="predicted residual",
-    )
-    ax.set_xlabel("Residual")
-    ax.set_ylabel("Density")
-    ax.set_title("Full test: true and predicted residual distributions")
-    ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_dir / "test_true_predicted_distribution.png", dpi=200)
-    plt.close(fig)
-
-
-def export_extreme_rows(
-    data: pd.DataFrame, files: list[Path], raw_indices: dict[str, np.ndarray],
-    y_values: np.ndarray, raw_predictions: dict[str, np.ndarray],
-    labels_by_split: dict[str, np.ndarray], z_scores_by_split: dict[str, np.ndarray],
-    output_dir: Path,
-) -> None:
-    """导出各 split 中超出训练 3σ 的完整原始记录及预测诊断字段。"""
-    for split_name, split_index in raw_indices.items():
-        mask = labels_by_split[split_name] == "beyond_3sigma"
-        positions = np.flatnonzero(mask)
-        frame = data.iloc[split_index[positions]].copy()
-        frame.insert(0, "original_row_index", frame.pop(ORIGINAL_ROW_COLUMN).to_numpy())
-        frame = frame.drop(columns=["index"], errors="ignore")
-        source_ids = frame[SOURCE_FILE_COLUMN].to_numpy(dtype=int)
-        frame.insert(1, "source_file", [str(files[value]) for value in source_ids])
-        true = y_values[split_index][positions]
-        predicted = raw_predictions[split_name][positions]
-        frame["true_residual"] = true
-        frame["predicted_residual"] = predicted
-        frame["prediction_error"] = predicted - true
-        frame["absolute_error"] = np.abs(predicted - true)
-        frame["residual_z_score"] = z_scores_by_split[split_name][positions]
-        frame["sigma_segment"] = labels_by_split[split_name][positions]
-        frame["tail_direction"] = np.where(frame["residual_z_score"] > 3, "positive", "negative")
-        output_name = f"{split_name}_extreme_beyond_3sigma.csv"
-        frame.to_csv(output_dir / output_name, index=False)
-        log(f"Exported {len(frame):,} extreme {split_name} rows to {output_name}")
 
 
 def save_training_history(
@@ -801,7 +508,7 @@ def save_feature_importance(
 def save_eda_figures(data: pd.DataFrame, output_dir: Path) -> None:
     """生成并保存探索性数据分析图表，包括直方图和相关性矩阵。"""
     numeric_data = data.select_dtypes(include=[np.number]).drop(
-        columns=[SOURCE_FILE_COLUMN, SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN], errors="ignore"
+        columns=[SOURCE_FILE_COLUMN], errors="ignore"
     )
     axes = numeric_data.hist(figsize=(16, 12), bins=40)
     figure = axes.ravel()[0].figure
@@ -827,25 +534,12 @@ def main() -> int:
     args = parse_args()
     validate_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    log("Command line: " + shlex.join(sys.argv))
 
     files = find_csv_files(args.input_dir, args.pattern, args.recursive)
     log(f"Found {len(files):,} CSV files")
-    pd.DataFrame([
-        {
-            "source_file_id": number,
-            "path": str(path.resolve()),
-            "size_bytes": path.stat().st_size,
-            "modified_time": pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").isoformat(),
-        }
-        for number, path in enumerate(files)
-    ]).to_csv(args.output_dir / "input_file_manifest.csv", index=False)
     data = load_csv_files(files, args.csv_engine, args.read_batch_size)
     data, feature_columns, fixed_altitude, original_altitude = clean_and_validate(
         data, args.fixed_altitude
-    )
-    data, sampling_summary = sample_valid_rows(
-        data, args.sample_fraction, args.sample_seed
     )
     log(f"Model features ({len(feature_columns)}): {feature_columns}")
     if args.save_eda:
@@ -853,11 +547,11 @@ def main() -> int:
 
     # 先按时间排序以保持输出稳定，再按年积日交错划分；保存原始行号映射。
     data_sorted = data.sort_values("datetime").reset_index(drop=False)
-    original_indices = data_sorted[ORIGINAL_ROW_COLUMN].to_numpy()
+    original_indices = data_sorted["index"].values
     data_sorted = data_sorted.reset_index(drop=True)
     raw_indices = split_by_day_of_year(data_sorted)
     indices, test_clean_index, sigma_filter = build_sigma_filtered_splits(
-        data_sorted, raw_indices, args.outlier_sigma, args.sigma_filter
+        data_sorted, raw_indices, args.outlier_sigma
     )
     x_values = data_sorted[feature_columns].to_numpy(dtype=np.float32)
     y_values = data_sorted[TARGET_COLUMN].to_numpy(dtype=np.float32)
@@ -898,44 +592,13 @@ def main() -> int:
             f"MAE={evaluations[name]['mae']:.6f}, R2={evaluations[name]['r2']:.6f}"
         )
 
-    raw_predictions = {
-        name: model.predict(x_values[split_index])
-        for name, split_index in raw_indices.items()
-    }
-    sigma_diagnostics, labels_by_split, z_scores_by_split = build_sigma_diagnostics(
-        raw_indices, y_values, raw_predictions,
-        float(sigma_filter["mean"]), float(sigma_filter["population_std"]),
-    )
-    sigma_diagnostics.to_csv(args.output_dir / "sigma_segment_metrics.csv", index=False)
-    for row in sigma_diagnostics.itertuples(index=False):
-        log(
-            f"sigma diagnostic {row.split}/{row.segment}: n={row.n_samples:,} "
-            f"({row.sample_ratio:.2%}), RMSE={row.rmse:.6f}, "
-            f"MAE={row.mae:.6f}, R2={row.r2:.6f}"
-        )
-    save_sigma_diagnostic_figures(
-        sigma_diagnostics, raw_indices, y_values, raw_predictions,
-        labels_by_split, z_scores_by_split, args.output_dir,
-        args.max_scatter_points, args.model_seed,
-    )
-    if args.export_extremes:
-        export_extreme_rows(
-            data_sorted, files, raw_indices, y_values, raw_predictions,
-            labels_by_split, z_scores_by_split, args.output_dir,
-        )
-
     test_index = indices["test"]
     test_clean_mask = np.isin(test_index, test_clean_index)
     test_predictions_frame = pd.DataFrame({
         "original_row_index": original_indices[test_index],
-        "source_file_id": data_sorted.iloc[test_index][SOURCE_FILE_COLUMN].to_numpy(),
-        "source_row_number": data_sorted.iloc[test_index][SOURCE_ROW_COLUMN].to_numpy(),
         "true_residual": y_values[test_index],
         "predicted_residual": predictions["test_full"],
         "prediction_error": predictions["test_full"] - y_values[test_index],
-        "absolute_error": np.abs(predictions["test_full"] - y_values[test_index]),
-        "residual_z_score": z_scores_by_split["test"],
-        "sigma_segment": labels_by_split["test"],
         "is_clean_by_training_sigma": test_clean_mask,
     })
     test_predictions_frame.to_csv(
@@ -958,12 +621,7 @@ def main() -> int:
     metrics = {
         "input_directory": str(args.input_dir.resolve()),
         "input_file_count": len(files),
-        "input_pattern": args.pattern,
-        "input_recursive": args.recursive,
-        "command_line": shlex.join(sys.argv),
-        "valid_row_count_before_sampling": sampling_summary["rows_before_sampling"],
-        "analyzed_row_count": len(data),
-        "sampling": sampling_summary,
+        "valid_row_count": len(data),
         "residual_sigma_filter": sigma_filter,
         "split_method": "deterministic interleaved day-of-year modulo 10",
         "split_ratio_target": {"train": 0.7, "validation": 0.2, "test": 0.1},
@@ -1006,9 +664,6 @@ def main() -> int:
             for name, index in raw_indices.items()
         },
         "model_seed": args.model_seed,
-        "sample_seed": args.sample_seed,
-        "sigma_filter_enabled": args.sigma_filter,
-        "extreme_rows_exported": args.export_extremes,
         "feature_columns": feature_columns,
         "fixed_altitude": fixed_altitude,
         "original_altitude": original_altitude,
