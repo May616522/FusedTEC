@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """Tune and train the Jason ionospheric-residual XGBoost model.
 
-The valid observations are split deterministically by day of year (DOY) into
-train/validation/test sets using an approximately 7:2:1 ratio. Complete calendar
-days are assigned together: DOY remainders 3 and 7 modulo 10 are validation
-days, remainder 0 is a test day, and all other remainders are training days.
-This interleaves validation and test samples throughout the year without random
-sampling. Residual outlier bounds are calculated from the training split only
-and applied to training and validation. The full test split is never filtered;
-results are reported for both the full test split and its clean subset. Optuna
-sees only training and validation data, and the test set remains untouched until
-the selected model is evaluated.
+Rows are sampled independently within every calendar day so that all available
+days remain represented. Complete days are then randomly assigned to
+train/validation/test; one day can belong to only one split. Local solar-time
+sine/cosine features are calculated from UTC timestamps and longitude, replacing
+the original UTC-hour features. Sigma thresholds always come from the raw
+training split and are reused for all diagnostics.
 """
 
 from __future__ import annotations
@@ -35,18 +31,18 @@ import pandas as pd
 import xgboost as xgb
 from optuna.samplers import TPESampler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 
 
 TARGET_COLUMN = "residual"
 SOURCE_FILE_COLUMN = "__source_file_id"
 SOURCE_ROW_COLUMN = "__source_row_number"
 ORIGINAL_ROW_COLUMN = "__cleaned_row_index"
-SPLIT_MODULUS = 10
-VALIDATION_DOY_REMAINDERS = frozenset({3, 7})
-TEST_DOY_REMAINDERS = frozenset({0})
+LOCAL_TIME_SIN_COLUMN = "local_time_s"
+LOCAL_TIME_COS_COLUMN = "local_time_c"
 EXCLUDED_COLUMNS = {
     "datetime", TARGET_COLUMN, "TEC_smooth", "TEC_raw", SOURCE_FILE_COLUMN,
-    SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN,
+    SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN, "HOD_s", "HOD_c",
 }
 SIGMA_SEGMENTS = ("within_1sigma", "sigma_1_to_2", "sigma_2_to_3", "beyond_3sigma")
 
@@ -56,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Optuna-tuned XGBoost regression for Jason residuals with a "
-            "deterministic, interleaved DOY split (7:2:1)."
+            "random, calendar-day-grouped train/validation/test split."
         )
     )
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -76,14 +72,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-fraction", type=float, default=1.0,
         help=(
-            "Randomly retain this fraction of valid rows before the date split. "
-            "Use 0.25 for a reproducible quarter-data trial; default: 1.0."
+            "Randomly retain this fraction within every valid calendar day. "
+            "Every day keeps at least one row; default: 1.0."
         ),
     )
     parser.add_argument(
         "--sample-seed", type=int, default=42,
         help="Random seed used only for --sample-fraction; default: 42.",
     )
+    parser.add_argument(
+        "--split-seed", type=int, default=42,
+        help="Random seed for assigning complete days to splits; default: 42.",
+    )
+    parser.add_argument("--train-ratio", type=float, default=0.70)
+    parser.add_argument("--validation-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument(
         "--fixed-altitude", type=float, default=None,
         help="Replace alt by this constant; default is the cleaned-data median.",
@@ -139,6 +142,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--outlier-sigma must be a positive finite number")
     if not np.isfinite(args.sample_fraction) or not 0 < args.sample_fraction <= 1:
         raise ValueError("--sample-fraction must be in the interval (0, 1]")
+    split_ratios = np.array(
+        [args.train_ratio, args.validation_ratio, args.test_ratio], dtype=float
+    )
+    if not np.all(np.isfinite(split_ratios)) or np.any(split_ratios <= 0):
+        raise ValueError("All split ratios must be positive finite numbers")
+    if not np.isclose(split_ratios.sum(), 1.0):
+        raise ValueError("Train/validation/test ratios must sum to 1.0")
     if args.n_jobs < 1 or args.read_batch_size < 1:
         raise ValueError("--n-jobs and --read-batch-size must be positive")
 
@@ -185,17 +195,37 @@ def load_csv_files(files: list[Path], csv_engine: str, batch_size: int) -> pd.Da
     return data
 
 
-def sample_valid_rows(
+def sample_rows_within_days(
     data: pd.DataFrame, fraction: float, seed: int
-) -> tuple[pd.DataFrame, dict[str, object]]:
-    """在日期划分前对有效记录做可复现的全局随机抽样。"""
+) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame]:
+    """在每个自然日内部独立随机抽样，确保所有日期均有记录。"""
     rows_before = len(data)
-    if fraction == 1.0:
-        sampled = data.copy()
-    else:
-        sample_size = max(10, int(round(rows_before * fraction)))
-        sample_size = min(sample_size, rows_before)
-        sampled = data.sample(n=sample_size, replace=False, random_state=seed)
+    calendar_dates = data["datetime"].dt.normalize()
+    rng = np.random.default_rng(seed)
+    selected_parts: list[np.ndarray] = []
+    daily_rows: list[dict[str, object]] = []
+    for calendar_date, positions in calendar_dates.groupby(calendar_dates).groups.items():
+        positions_array = np.asarray(positions, dtype=np.int64)
+        sample_size = len(positions_array)
+        if fraction < 1.0:
+            sample_size = max(1, int(round(len(positions_array) * fraction)))
+            sample_size = min(sample_size, len(positions_array))
+            selected = rng.choice(positions_array, size=sample_size, replace=False)
+        else:
+            selected = positions_array
+        selected_parts.append(selected)
+        daily_rows.append({
+            "calendar_date": calendar_date,
+            "year": int(calendar_date.year),
+            "day_of_year": int(calendar_date.dayofyear),
+            "month": int(calendar_date.month),
+            "rows_before_sampling": int(len(positions_array)),
+            "rows_after_sampling": int(sample_size),
+            "realized_fraction": float(sample_size / len(positions_array)),
+        })
+    selected_index = np.sort(np.concatenate(selected_parts))
+    sampled = data.iloc[selected_index].reset_index(drop=True)
+    daily_sampling = pd.DataFrame(daily_rows).sort_values("calendar_date").reset_index(drop=True)
     sampled = sampled.reset_index(drop=True)
     summary = {
         "requested_fraction": float(fraction),
@@ -203,13 +233,17 @@ def sample_valid_rows(
         "rows_before_sampling": int(rows_before),
         "rows_after_sampling": int(len(sampled)),
         "realized_fraction": float(len(sampled) / rows_before),
-        "stage": "after validation/NA removal and before deterministic date split",
+        "calendar_days_before_sampling": int(calendar_dates.nunique()),
+        "calendar_days_after_sampling": int(sampled["datetime"].dt.normalize().nunique()),
+        "minimum_rows_retained_per_day": int(daily_sampling["rows_after_sampling"].min()),
+        "stage": "within each valid calendar day before whole-day random split",
     }
     log(
-        f"Random sampling: retained {len(sampled):,}/{rows_before:,} valid rows "
-        f"({len(sampled) / rows_before:.2%}), seed={seed}"
+        f"Within-day random sampling: retained {len(sampled):,}/{rows_before:,} valid rows "
+        f"({len(sampled) / rows_before:.2%}) across all "
+        f"{summary['calendar_days_after_sampling']:,} days, seed={seed}"
     )
-    return sampled, summary
+    return sampled, summary, daily_sampling
 
 
 def clean_and_validate(
@@ -221,17 +255,9 @@ def clean_and_validate(
     if missing:
         raise ValueError(f"Required columns are missing: {missing}")
 
-    feature_columns = [column for column in data.columns if column not in EXCLUDED_COLUMNS]
-    if not feature_columns:
-        raise ValueError("No feature columns remain after exclusions")
-    non_numeric = [
-        column for column in [*feature_columns, TARGET_COLUMN]
-        if not pd.api.types.is_numeric_dtype(data[column])
-    ]
-    if non_numeric:
-        raise TypeError(f"Model columns must be numeric: {non_numeric}")
-
-    parsed_datetime = pd.to_datetime(data["datetime"], errors="coerce")
+    # UTC-hour sine/cosine are replaced below by longitude-adjusted local time.
+    data = data.drop(columns=["HOD_s", "HOD_c"], errors="ignore")
+    parsed_datetime = pd.to_datetime(data["datetime"], errors="coerce", utc=True)
     invalid_datetime_count = int(parsed_datetime.isna().sum())
     if invalid_datetime_count:
         log(f"Rows with invalid datetime values: {invalid_datetime_count:,}")
@@ -244,7 +270,7 @@ def clean_and_validate(
     log(f"Rows before cleaning: {rows_before:,}")
     log(f"Rows removed: {rows_before - len(data):,}; retained: {len(data):,}")
     if len(data) < 10:
-        raise ValueError(f"Too few valid rows for a 7:2:1 split: {len(data)}")
+        raise ValueError(f"Too few valid rows for modeling: {len(data)}")
     data[ORIGINAL_ROW_COLUMN] = np.arange(len(data), dtype=np.int64)
 
     original_altitude = {
@@ -258,10 +284,35 @@ def clean_and_validate(
     if not np.isfinite(fixed_altitude):
         raise ValueError("--fixed-altitude must be finite")
     data.loc[:, "alt"] = fixed_altitude
+    utc_hour = (
+        data["datetime"].dt.hour.to_numpy(dtype=float)
+        + data["datetime"].dt.minute.to_numpy(dtype=float) / 60.0
+        + data["datetime"].dt.second.to_numpy(dtype=float) / 3600.0
+        + data["datetime"].dt.microsecond.to_numpy(dtype=float) / 3_600_000_000.0
+    )
+    local_solar_hour = np.mod(
+        utc_hour + data["lon"].to_numpy(dtype=float) / 15.0, 24.0
+    )
+    phase = 2.0 * np.pi * local_solar_hour / 24.0
+    data[LOCAL_TIME_SIN_COLUMN] = np.sin(phase)
+    data[LOCAL_TIME_COS_COLUMN] = np.cos(phase)
+    feature_columns = [column for column in data.columns if column not in EXCLUDED_COLUMNS]
+    if not feature_columns:
+        raise ValueError("No feature columns remain after exclusions")
+    non_numeric = [
+        column for column in [*feature_columns, TARGET_COLUMN]
+        if not pd.api.types.is_numeric_dtype(data[column])
+    ]
+    if non_numeric:
+        raise TypeError(f"Model columns must be numeric: {non_numeric}")
     log(
         "Original altitude range: "
         f"{original_altitude['minimum']:.6f} to {original_altitude['maximum']:.6f}; "
         f"fixed at {fixed_altitude:.6f}"
+    )
+    log(
+        "Replaced UTC HOD_s/HOD_c with local solar-time features "
+        f"{LOCAL_TIME_SIN_COLUMN}/{LOCAL_TIME_COS_COLUMN} computed from UTC datetime and longitude"
     )
     return data, feature_columns, fixed_altitude, original_altitude
 
@@ -350,23 +401,72 @@ def build_sigma_filtered_splits(
     return filtered_splits, test_clean_index, sigma_filter
 
 
-def split_by_day_of_year(data: pd.DataFrame) -> dict[str, np.ndarray]:
-    """按年积日模10确定性交错划分，确保同一自然日不会跨集合。"""
-    day_of_year = data["datetime"].dt.dayofyear.to_numpy()
-    remainders = day_of_year % SPLIT_MODULUS
-    validation_mask = np.isin(remainders, list(VALIDATION_DOY_REMAINDERS))
-    test_mask = np.isin(remainders, list(TEST_DOY_REMAINDERS))
-    train_mask = ~(validation_mask | test_mask)
+def split_by_calendar_day(
+    data: pd.DataFrame, daily_sampling: pd.DataFrame, split_seed: int,
+    train_ratio: float, validation_ratio: float, test_ratio: float,
+    output_dir: Path,
+) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
+    """按完整自然日随机划分，并按月份分层以维持季节覆盖。"""
+    date_frame = daily_sampling[[
+        "calendar_date", "year", "day_of_year", "month",
+        "rows_before_sampling", "rows_after_sampling", "realized_fraction",
+    ]].copy()
+    if len(date_frame) < 7:
+        raise ValueError("Too few calendar days for a grouped train/validation/test split")
+    temporary_ratio = validation_ratio + test_ratio
+    try:
+        train_days, temporary_days = train_test_split(
+            date_frame,
+            train_size=train_ratio,
+            random_state=split_seed,
+            shuffle=True,
+            stratify=date_frame["month"],
+        )
+        validation_days, test_days = train_test_split(
+            temporary_days,
+            train_size=validation_ratio / temporary_ratio,
+            random_state=split_seed + 1,
+            shuffle=True,
+            stratify=temporary_days["month"],
+        )
+        stratified_by_month = True
+    except ValueError as error:
+        log(f"Monthly stratification unavailable ({error}); using unstratified day split")
+        train_days, temporary_days = train_test_split(
+            date_frame, train_size=train_ratio, random_state=split_seed, shuffle=True
+        )
+        validation_days, test_days = train_test_split(
+            temporary_days,
+            train_size=validation_ratio / temporary_ratio,
+            random_state=split_seed + 1,
+            shuffle=True,
+        )
+        stratified_by_month = False
 
+    assignments = []
+    for split_name, split_days in (
+        ("train", train_days), ("validation", validation_days), ("test", test_days)
+    ):
+        part = split_days.copy()
+        part["split"] = split_name
+        assignments.append(part)
+    day_assignments = (
+        pd.concat(assignments, ignore_index=True)
+        .sort_values("calendar_date")
+        .reset_index(drop=True)
+    )
+    split_lookup = day_assignments.set_index("calendar_date")["split"]
+    row_split = data["datetime"].dt.normalize().map(split_lookup)
+    if row_split.isna().any():
+        raise RuntimeError(f"{int(row_split.isna().sum()):,} rows lack a day assignment")
     splits = {
-        "train": np.flatnonzero(train_mask),
-        "validation": np.flatnonzero(validation_mask),
-        "test": np.flatnonzero(test_mask),
+        name: np.flatnonzero(row_split.to_numpy() == name)
+        for name in ("train", "validation", "test")
     }
     empty_splits = [name for name, index in splits.items() if len(index) == 0]
     if empty_splits:
         raise ValueError(
-            "DOY split produced empty datasets: " + ", ".join(empty_splits)
+            "Calendar-day split produced empty datasets: " + ", ".join(empty_splits)
         )
 
     total = len(data)
@@ -374,17 +474,24 @@ def split_by_day_of_year(data: pd.DataFrame) -> dict[str, np.ndarray]:
     if assigned_rows != total:
         raise RuntimeError(f"DOY split assigned {assigned_rows:,}/{total:,} rows")
 
-    split_labels = np.empty(total, dtype=object)
-    for name, index in splits.items():
-        split_labels[index] = name
-    day_assignments = pd.DataFrame({
-        "calendar_date": data["datetime"].dt.normalize(),
-        "split": split_labels,
+    row_assignments = pd.DataFrame({
+        "calendar_date": data["datetime"].dt.normalize(), "split": row_split,
     })
-    if day_assignments.groupby("calendar_date")["split"].nunique().max() != 1:
+    if row_assignments.groupby("calendar_date")["split"].nunique().max() != 1:
         raise RuntimeError("At least one calendar date was assigned to multiple splits")
+    day_assignments["calendar_date"] = day_assignments["calendar_date"].dt.strftime("%Y-%m-%d")
+    day_assignments.to_csv(output_dir / "day_assignments.csv", index=False)
+    monthly_summary = pd.crosstab(day_assignments["month"], day_assignments["split"])
+    monthly_summary = monthly_summary.reindex(
+        columns=["train", "validation", "test"], fill_value=0
+    )
+    monthly_summary.to_csv(output_dir / "monthly_day_split_summary.csv")
 
-    log("Dataset split: deterministic interleaved DOY modulo 10 (7:2:1)")
+    log(
+        "Dataset split: random complete-calendar-day assignment with ratios "
+        f"{train_ratio:g}/{validation_ratio:g}/{test_ratio:g}; seed={split_seed}; "
+        f"monthly stratification={'enabled' if stratified_by_month else 'fallback disabled'}"
+    )
     for name, index in splits.items():
         split_dates = data.iloc[index]["datetime"].dt.normalize()
         log(
@@ -392,7 +499,7 @@ def split_by_day_of_year(data: pd.DataFrame) -> dict[str, np.ndarray]:
             f"calendar days={split_dates.nunique():,}, "
             f"date coverage={split_dates.min().date()} to {split_dates.max().date()}"
         )
-    return splits
+    return splits, day_assignments
 
 
 def base_parameters(args: argparse.Namespace) -> dict[str, object]:
@@ -844,18 +951,22 @@ def main() -> int:
     data, feature_columns, fixed_altitude, original_altitude = clean_and_validate(
         data, args.fixed_altitude
     )
-    data, sampling_summary = sample_valid_rows(
+    data, sampling_summary, daily_sampling = sample_rows_within_days(
         data, args.sample_fraction, args.sample_seed
     )
     log(f"Model features ({len(feature_columns)}): {feature_columns}")
     if args.save_eda:
         save_eda_figures(data, args.output_dir)
 
-    # 先按时间排序以保持输出稳定，再按年积日交错划分；保存原始行号映射。
+    # 先按时间排序以保持输出稳定，再把完整自然日随机分配到三个集合。
     data_sorted = data.sort_values("datetime").reset_index(drop=False)
     original_indices = data_sorted[ORIGINAL_ROW_COLUMN].to_numpy()
     data_sorted = data_sorted.reset_index(drop=True)
-    raw_indices = split_by_day_of_year(data_sorted)
+    raw_indices, day_assignments = split_by_calendar_day(
+        data_sorted, daily_sampling, args.split_seed,
+        args.train_ratio, args.validation_ratio, args.test_ratio,
+        args.output_dir,
+    )
     indices, test_clean_index, sigma_filter = build_sigma_filtered_splits(
         data_sorted, raw_indices, args.outlier_sigma, args.sigma_filter
     )
@@ -965,18 +1076,18 @@ def main() -> int:
         "analyzed_row_count": len(data),
         "sampling": sampling_summary,
         "residual_sigma_filter": sigma_filter,
-        "split_method": "deterministic interleaved day-of-year modulo 10",
-        "split_ratio_target": {"train": 0.7, "validation": 0.2, "test": 0.1},
+        "split_method": "random complete-calendar-day split stratified by month",
+        "split_ratio_target": {
+            "train": args.train_ratio,
+            "validation": args.validation_ratio,
+            "test": args.test_ratio,
+        },
         "split_rule": {
-            "modulus": SPLIT_MODULUS,
-            "train_remainders": sorted(
-                set(range(SPLIT_MODULUS))
-                - VALIDATION_DOY_REMAINDERS
-                - TEST_DOY_REMAINDERS
-            ),
-            "validation_remainders": sorted(VALIDATION_DOY_REMAINDERS),
-            "test_remainders": sorted(TEST_DOY_REMAINDERS),
             "grouping_unit": "calendar date",
+            "assignment_seed": args.split_seed,
+            "stratification": "calendar month when feasible",
+            "same_day_cross_split_allowed": False,
+            "assignment_file": "day_assignments.csv",
         },
         "split_rows_before_sigma": {
             name: len(value) for name, value in raw_indices.items()
@@ -1007,8 +1118,15 @@ def main() -> int:
         },
         "model_seed": args.model_seed,
         "sample_seed": args.sample_seed,
+        "split_seed": args.split_seed,
         "sigma_filter_enabled": args.sigma_filter,
         "extreme_rows_exported": args.export_extremes,
+        "time_features": {
+            "source_datetime_timezone": "UTC",
+            "local_solar_hour_formula": "(UTC fractional hour + longitude / 15) modulo 24",
+            "columns": [LOCAL_TIME_SIN_COLUMN, LOCAL_TIME_COS_COLUMN],
+            "replaced_columns": ["HOD_s", "HOD_c"],
+        },
         "feature_columns": feature_columns,
         "fixed_altitude": fixed_altitude,
         "original_altitude": original_altitude,

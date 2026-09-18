@@ -9,14 +9,13 @@
 #SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/jason2021/xg_jason_ion_%j.err
 
 # Slurm job file for xg_Jason_ion.py.
-# Trains an XGBoost model for Jason ionospheric residuals using a deterministic
-# interleaved day-of-year split. For DOY modulo 10, remainders 3 and 7 form the
-# validation set, remainder 0 forms the test set, and all others form training.
-# Complete calendar days stay together, giving an approximate 7:2:1 ratio.
-# The residual 3-sigma bounds are fitted on training data only and applied to
-# training/validation. The full test set is preserved; metrics and plots are
-# produced for both the full test set and its training-bounds clean subset.
-# gim_vtec is included as a model feature.
+# Trains an XGBoost model for Jason ionospheric residuals using a reproducible
+# random complete-calendar-day split. A reproducible 25% sample is first drawn
+# independently within every day, so every available day remains represented.
+# Whole days are then assigned 70%/15%/15% to train/validation/test with monthly
+# stratification; the same day can never cross splits. Training tails are kept,
+# while training-derived sigma thresholds remain available for diagnostics.
+# Local solar-time sine/cosine replace UTC HOD sine/cosine.
 # If your cluster requires them, also add its #SBATCH --partition and
 # #SBATCH --account lines above. Resource limits (CPU, memory, time) should be
 # adjusted to the rules of your cluster.
@@ -31,7 +30,7 @@ INPUT_DIR="/share/home/u23114/tj23114/data/Yaoyaping_data/jason2021"
 
 # Quick quarter-data diagnostic experiment. Each Slurm job gets an independent
 # directory so an earlier result cannot be overwritten accidentally.
-EXPERIMENT_NAME="quarter_seed42_sigma3"
+EXPERIMENT_NAME="quarter_within_day_seed42_no_sigma_localtime"
 RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
 
@@ -39,15 +38,20 @@ OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
 # is the median of the local 2021 data (original range: 1339.02 to 1356.56).
 FIXED_ALTITUDE="1345.803773"
 
-# Optuna tuning budget. Set OPTUNA_TIMEOUT=0 to rely only on N_TRIALS.
-N_TRIALS="100"
-OPTUNA_TIMEOUT="21600"
+# A smaller fresh search is sufficient for the changed split/feature setup.
+# Set OPTUNA_TIMEOUT=0 to rely only on N_TRIALS.
+N_TRIALS="30"
+OPTUNA_TIMEOUT="7200"
 MIN_ESTIMATORS="200"
 MAX_ESTIMATORS="2000"
 EARLY_STOPPING_ROUNDS="100"
 MODEL_SEED="42"
 SAMPLE_FRACTION="0.25"
 SAMPLE_SEED="42"
+SPLIT_SEED="42"
+TRAIN_RATIO="0.70"
+VALIDATION_RATIO="0.15"
+TEST_RATIO="0.15"
 OUTLIER_SIGMA="3.0"
 
 # Optional parameters (commented out by default):
@@ -58,8 +62,9 @@ OUTLIER_SIGMA="3.0"
 # --max-scatter-points: Max points to plot in test figures (default: 200000)
 # --save-eda: Generate exploratory data analysis plots (add flag to enable)
 # --outlier-sigma: Training-only mean +/- N sigma bounds (set below to 3.0)
-# --sample-fraction: 1.0 restores a full-data run; this experiment uses 0.25
-# --sample-seed: makes the random quarter-data subset reproducible
+# --sample-fraction: sampled independently inside every day; this run uses 0.25
+# --sample-seed: makes each day's random quarter-data subset reproducible
+# --split-seed: makes the whole-day 70/15/15 assignment reproducible
 # --no-sigma-filter: retain tail targets for an unfiltered comparison experiment
 # --export-extremes: export full records outside the training-derived 3-sigma bounds
 
@@ -103,12 +108,12 @@ echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
 echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
 echo "Experiment: ${EXPERIMENT_NAME}"
-echo "Random valid-row sample: ${SAMPLE_FRACTION} (seed=${SAMPLE_SEED})"
-echo "Dataset split: interleaved DOY modulo 10, train/validation/test = 7/2/1"
-echo "DOY remainders: validation={3,7}, test={0}, training=all others"
-echo "Residual outlier filter: training-only mean +/- ${OUTLIER_SIGMA} sigma"
+echo "Within-day random sample: ${SAMPLE_FRACTION} (seed=${SAMPLE_SEED}); every day retained"
+echo "Whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
+echo "Residual outlier filter: disabled for training; ${OUTLIER_SIGMA}-sigma retained for diagnostics"
 echo "Test evaluation: full test set plus clean subset; full test is never filtered"
 echo "Additional model feature: gim_vtec"
+echo "Time features: local solar-time sine/cosine computed from UTC datetime and longitude"
 
 COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --input-dir "${INPUT_DIR}" \
@@ -116,8 +121,12 @@ COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --fixed-altitude "${FIXED_ALTITUDE}" \
     --sample-fraction "${SAMPLE_FRACTION}" \
     --sample-seed "${SAMPLE_SEED}" \
+    --split-seed "${SPLIT_SEED}" \
+    --train-ratio "${TRAIN_RATIO}" \
+    --validation-ratio "${VALIDATION_RATIO}" \
+    --test-ratio "${TEST_RATIO}" \
     --outlier-sigma "${OUTLIER_SIGMA}" \
-    --sigma-filter \
+    --no-sigma-filter \
     --export-extremes \
     --n-trials "${N_TRIALS}" \
     --optuna-timeout "${OPTUNA_TIMEOUT}" \
