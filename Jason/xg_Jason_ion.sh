@@ -10,11 +10,12 @@
 
 # Slurm job file for xg_Jason_ion.py.
 # Trains an XGBoost model for Jason ionospheric residuals using a reproducible
-# random complete-calendar-day split. A reproducible 25% sample is first drawn
-# independently within every day, so every available day remains represented.
-# Whole days are then assigned 70%/15%/15% to train/validation/test with monthly
-# stratification; the same day can never cross splits. Training tails are kept,
-# while training-derived sigma thresholds remain available for diagnostics.
+# random complete-calendar-day split. All valid rows are retained before
+# complete calendar days are assigned to train/validation/test.
+# Complete days are randomly assigned 70%/15%/15% to train/validation/test;
+# every row from one day stays in exactly one split. Rows with residual < 0 are
+# removed before sampling and splitting. The model uses at most 300 boosting
+# rounds with early stopping, plus explicit L1 and L2 regularization.
 # Local solar-time sine/cosine replace UTC HOD sine/cosine.
 # If your cluster requires them, also add its #SBATCH --partition and
 # #SBATCH --account lines above. Resource limits (CPU, memory, time) should be
@@ -28,9 +29,9 @@ PYTHON_SCRIPT="${SCRIPT_DIR}/xg_Jason_ion.py"
 # This directory must directly contain the processed CSV files.
 INPUT_DIR="/share/home/u23114/tj23114/data/Yaoyaping_data/jason2021"
 
-# Quick quarter-data diagnostic experiment. Each Slurm job gets an independent
-# directory so an earlier result cannot be overwritten accidentally.
-EXPERIMENT_NAME="quarter_within_day_seed42_no_sigma_localtime"
+# Each Slurm job gets an independent directory so an earlier result cannot be
+# overwritten accidentally.
+EXPERIMENT_NAME="full_data_random_day_residual_nonnegative_regularized_300rounds"
 RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
 
@@ -42,17 +43,17 @@ FIXED_ALTITUDE="1345.803773"
 # Set OPTUNA_TIMEOUT=0 to rely only on N_TRIALS.
 N_TRIALS="30"
 OPTUNA_TIMEOUT="7200"
-MIN_ESTIMATORS="200"
-MAX_ESTIMATORS="2000"
-EARLY_STOPPING_ROUNDS="100"
+N_ESTIMATORS="300"
+EARLY_STOPPING_ROUNDS="30"
+REG_ALPHA="0.1"
+REG_LAMBDA="1.0"
 MODEL_SEED="42"
-SAMPLE_FRACTION="0.25"
+SAMPLE_FRACTION="1.0"
 SAMPLE_SEED="42"
 SPLIT_SEED="42"
 TRAIN_RATIO="0.70"
 VALIDATION_RATIO="0.15"
 TEST_RATIO="0.15"
-OUTLIER_SIGMA="3.0"
 
 # Optional parameters (commented out by default):
 # --pattern: File pattern to match (default: "*.csv")
@@ -61,12 +62,10 @@ OUTLIER_SIGMA="3.0"
 # --read-batch-size: Number of CSV files to read in batch (default: 250)
 # --max-scatter-points: Max points to plot in test figures (default: 200000)
 # --save-eda: Generate exploratory data analysis plots (add flag to enable)
-# --outlier-sigma: Training-only mean +/- N sigma bounds (set below to 3.0)
-# --sample-fraction: sampled independently inside every day; this run uses 0.25
-# --sample-seed: makes each day's random quarter-data subset reproducible
-# --split-seed: makes the whole-day 70/15/15 assignment reproducible
-# --no-sigma-filter: retain tail targets for an unfiltered comparison experiment
-# --export-extremes: export full records outside the training-derived 3-sigma bounds
+# --sample-fraction: fraction retained inside every day; this run uses 1.0
+# --sample-seed: used only when sample-fraction is smaller than 1.0
+# --split-strategy random-day: randomly assign complete days (used below)
+# --split-strategy time: optional chronological extrapolation comparison
 
 # Directly use the Python executable in LiuQingyuan's Conda environment. This
 # is more reliable than `conda activate` in a non-interactive Slurm job.
@@ -108,10 +107,12 @@ echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
 echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
 echo "Experiment: ${EXPERIMENT_NAME}"
-echo "Within-day random sample: ${SAMPLE_FRACTION} (seed=${SAMPLE_SEED}); every day retained"
-echo "Whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
-echo "Residual outlier filter: disabled for training; ${OUTLIER_SIGMA}-sigma retained for diagnostics"
-echo "Test evaluation: full test set plus clean subset; full test is never filtered"
+echo "Within-day sampling fraction: ${SAMPLE_FRACTION}; all valid rows retained"
+echo "Random whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
+echo "Calendar-day constraint: every row from one day stays in exactly one split"
+echo "Target QC: residual < 0 removed before sampling and splitting"
+echo "Training: max ${N_ESTIMATORS} rounds, early stopping=${EARLY_STOPPING_ROUNDS}"
+echo "Regularization: L1 reg_alpha=${REG_ALPHA}; L2 reg_lambda=${REG_LAMBDA}"
 echo "Additional model feature: gim_vtec"
 echo "Time features: local solar-time sine/cosine computed from UTC datetime and longitude"
 
@@ -121,18 +122,17 @@ COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
     --fixed-altitude "${FIXED_ALTITUDE}" \
     --sample-fraction "${SAMPLE_FRACTION}" \
     --sample-seed "${SAMPLE_SEED}" \
+    --split-strategy random-day \
     --split-seed "${SPLIT_SEED}" \
     --train-ratio "${TRAIN_RATIO}" \
     --validation-ratio "${VALIDATION_RATIO}" \
     --test-ratio "${TEST_RATIO}" \
-    --outlier-sigma "${OUTLIER_SIGMA}" \
-    --no-sigma-filter \
-    --export-extremes \
     --n-trials "${N_TRIALS}" \
     --optuna-timeout "${OPTUNA_TIMEOUT}" \
-    --min-estimators "${MIN_ESTIMATORS}" \
-    --max-estimators "${MAX_ESTIMATORS}" \
+    --n-estimators "${N_ESTIMATORS}" \
     --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}" \
+    --reg-alpha "${REG_ALPHA}" \
+    --reg-lambda "${REG_LAMBDA}" \
     --model-seed "${MODEL_SEED}" \
     --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
 

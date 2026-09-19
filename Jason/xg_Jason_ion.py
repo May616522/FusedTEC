@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Tune and train the Jason ionospheric-residual XGBoost model.
+"""Tune, train and audit the Jason ionospheric-residual XGBoost model.
 
-Rows are sampled independently within every calendar day so that all available
-days remain represented. Complete days are then randomly assigned to
-train/validation/test; one day can belong to only one split. Local solar-time
-sine/cosine features are calculated from UTC timestamps and longitude, replacing
-the original UTC-hour features. Sigma thresholds always come from the raw
-training split and are reused for all diagnostics.
+The default workflow keeps statistically rare targets and randomly assigns
+complete calendar days to train/validation/test. A calendar day is an
+indivisible group: all rows from that day must stay in exactly one split.
+Every target threshold is fitted on the training split only, and validation/test
+are evaluated at their natural frequency.
+Rows whose residual is negative are removed by the documented hard-QC rule
+before sampling and splitting.
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ import pandas as pd
 import xgboost as xgb
 from optuna.samplers import TPESampler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 
 
 TARGET_COLUMN = "residual"
@@ -44,7 +44,16 @@ EXCLUDED_COLUMNS = {
     "datetime", TARGET_COLUMN, "TEC_smooth", "TEC_raw", SOURCE_FILE_COLUMN,
     SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN, "HOD_s", "HOD_c",
 }
+# Compatibility constants for the retained diagnostic helper functions. The
+# simplified main workflow below does not invoke sigma/tail segmentation or
+# sample weighting.
 SIGMA_SEGMENTS = ("within_1sigma", "sigma_1_to_2", "sigma_2_to_3", "beyond_3sigma")
+TAIL_SEGMENTS = ("extreme_low", "low", "central", "high", "extreme_high")
+WEIGHT_LEVELS = {
+    "none": (1.0, 1.0, 1.0),
+    "1-2-4": (1.0, 2.0, 4.0),
+    "1-2-6": (1.0, 2.0, 6.0),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Optuna-tuned XGBoost regression for Jason residuals with a "
-            "random, calendar-day-grouped train/validation/test split."
+            "leakage-safe, calendar-day-grouped train/validation/test split."
         )
     )
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -65,15 +74,26 @@ def parse_args() -> argparse.Namespace:
         "--optuna-timeout", type=int, default=3600,
         help="Optuna time limit in seconds; 0 disables the limit.",
     )
-    parser.add_argument("--min-estimators", type=int, default=200)
-    parser.add_argument("--max-estimators", type=int, default=2000)
-    parser.add_argument("--early-stopping-rounds", type=int, default=100)
+    parser.add_argument(
+        "--n-estimators", type=int, default=300,
+        help="Maximum boosting rounds; default: 300.",
+    )
+    parser.add_argument("--early-stopping-rounds", type=int, default=30)
+    parser.add_argument(
+        "--reg-alpha", type=float, default=0.1,
+        help="Positive L1 regularization coefficient; default: 0.1.",
+    )
+    parser.add_argument(
+        "--reg-lambda", type=float, default=1.0,
+        help="Positive L2 regularization coefficient; default: 1.0.",
+    )
     parser.add_argument("--model-seed", type=int, default=42)
     parser.add_argument(
         "--sample-fraction", type=float, default=1.0,
         help=(
             "Randomly retain this fraction within every valid calendar day. "
-            "Every day keeps at least one row; default: 1.0."
+            "The default 1.0 retains every valid row; smaller values keep at "
+            "least one row from every day."
         ),
     )
     parser.add_argument(
@@ -82,7 +102,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split-seed", type=int, default=42,
-        help="Random seed for assigning complete days to splits; default: 42.",
+        help="Random seed used only by --split-strategy random-day.",
+    )
+    parser.add_argument(
+        "--split-strategy", choices=("random-day", "time"), default="random-day",
+        help=(
+            "Randomly assign indivisible calendar days (default), or use "
+            "chronological whole-day blocks for an optional extrapolation test."
+        ),
     )
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--validation-ratio", type=float, default=0.15)
@@ -90,28 +117,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixed-altitude", type=float, default=None,
         help="Replace alt by this constant; default is the cleaned-data median.",
-    )
-    parser.add_argument(
-        "--outlier-sigma", type=float, default=3.0,
-        help=(
-            "Remove target rows outside mean +/- N population standard deviations "
-            "using bounds calculated from the training split only. The test split "
-            "is not filtered; default: 3.0."
-        ),
-    )
-    sigma_group = parser.add_mutually_exclusive_group()
-    sigma_group.add_argument(
-        "--sigma-filter", dest="sigma_filter", action="store_true",
-        help="Filter training and validation targets using training-derived bounds (default).",
-    )
-    sigma_group.add_argument(
-        "--no-sigma-filter", dest="sigma_filter", action="store_false",
-        help="Keep target-tail rows in training and validation; diagnostics are still produced.",
-    )
-    parser.set_defaults(sigma_filter=True)
-    parser.add_argument(
-        "--export-extremes", action="store_true",
-        help="Export all train/validation/test rows beyond the training-derived 3-sigma bounds.",
     )
     parser.add_argument(
         "--n-jobs", type=int,
@@ -134,14 +139,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n-trials must be at least 1")
     if args.optuna_timeout < 0:
         raise ValueError("--optuna-timeout cannot be negative")
-    if args.min_estimators < 1 or args.max_estimators < args.min_estimators:
-        raise ValueError("Estimator range is invalid")
+    if args.n_estimators < 1:
+        raise ValueError("--n-estimators must be positive")
     if args.early_stopping_rounds < 0:
         raise ValueError("--early-stopping-rounds cannot be negative")
-    if not np.isfinite(args.outlier_sigma) or args.outlier_sigma <= 0:
-        raise ValueError("--outlier-sigma must be a positive finite number")
     if not np.isfinite(args.sample_fraction) or not 0 < args.sample_fraction <= 1:
         raise ValueError("--sample-fraction must be in the interval (0, 1]")
+    if not np.isfinite(args.reg_alpha) or args.reg_alpha <= 0:
+        raise ValueError("--reg-alpha must be a positive finite number")
+    if not np.isfinite(args.reg_lambda) or args.reg_lambda <= 0:
+        raise ValueError("--reg-lambda must be a positive finite number")
     split_ratios = np.array(
         [args.train_ratio, args.validation_ratio, args.test_ratio], dtype=float
     )
@@ -248,7 +255,9 @@ def sample_rows_within_days(
 
 def clean_and_validate(
     data: pd.DataFrame, requested_altitude: float | None
-) -> tuple[pd.DataFrame, list[str], float, dict[str, float]]:
+) -> tuple[
+    pd.DataFrame, list[str], float, dict[str, float], dict[str, object], pd.DataFrame
+]:
     """清理缺失/无穷值，验证数据完整性，并固定高度值。"""
     required = {TARGET_COLUMN, "datetime", "lat", "lon", "alt", "gim_vtec"}
     missing = sorted(required.difference(data.columns))
@@ -266,7 +275,38 @@ def clean_and_validate(
     numeric_columns = data.select_dtypes(include=[np.number]).columns
     data.loc[:, numeric_columns] = data[numeric_columns].replace([np.inf, -np.inf], np.nan)
     rows_before = len(data)
-    data = data.dropna(axis=0, how="any").reset_index(drop=True)
+    missing_or_nonfinite = data.isna().any(axis=1)
+    negative_target = data[TARGET_COLUMN] < 0
+    duplicate_columns = [
+        column for column in data.columns
+        if column not in {SOURCE_FILE_COLUMN, SOURCE_ROW_COLUMN}
+    ]
+    exact_duplicate = data.duplicated(subset=duplicate_columns, keep="first")
+    removed_mask = missing_or_nonfinite | exact_duplicate | negative_target
+    removed_records = data.loc[
+        removed_mask,
+        [SOURCE_FILE_COLUMN, SOURCE_ROW_COLUMN, "datetime"],
+    ].copy()
+    removed_records["qc_reason"] = np.select(
+        [negative_target[removed_mask], missing_or_nonfinite[removed_mask]],
+        ["residual_below_zero", "missing_or_nonfinite"],
+        default="exact_duplicate",
+    )
+    data = data.loc[~removed_mask].reset_index(drop=True)
+    qc_log: dict[str, object] = {
+        "rows_before": int(rows_before),
+        "invalid_datetime": invalid_datetime_count,
+        "missing_or_nonfinite": int(missing_or_nonfinite.sum()),
+        "exact_duplicate": int(exact_duplicate.sum()),
+        "residual_below_zero": int(negative_target.sum()),
+        "rows_removed": int(removed_mask.sum()),
+        "rows_retained": int(len(data)),
+        "rules": [
+            "all model fields finite/non-missing",
+            "remove exact duplicate records",
+            "remove rows where residual < 0 before sampling and splitting",
+        ],
+    }
     log(f"Rows before cleaning: {rows_before:,}")
     log(f"Rows removed: {rows_before - len(data):,}; retained: {len(data):,}")
     if len(data) < 10:
@@ -283,7 +323,7 @@ def clean_and_validate(
     )
     if not np.isfinite(fixed_altitude):
         raise ValueError("--fixed-altitude must be finite")
-    data.loc[:, "alt"] = fixed_altitude
+    data["alt"] = np.full(len(data), fixed_altitude, dtype=np.float32)
     utc_hour = (
         data["datetime"].dt.hour.to_numpy(dtype=float)
         + data["datetime"].dt.minute.to_numpy(dtype=float) / 60.0
@@ -314,14 +354,17 @@ def clean_and_validate(
         "Replaced UTC HOD_s/HOD_c with local solar-time features "
         f"{LOCAL_TIME_SIN_COLUMN}/{LOCAL_TIME_COS_COLUMN} computed from UTC datetime and longitude"
     )
-    return data, feature_columns, fixed_altitude, original_altitude
+    return (
+        data, feature_columns, fixed_altitude, original_altitude,
+        qc_log, removed_records,
+    )
 
 
 def build_sigma_filtered_splits(
     data: pd.DataFrame, splits: dict[str, np.ndarray], outlier_sigma: float,
     apply_filter: bool,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, object]]:
-    """仅用训练集计算 residual 阈值，过滤训练/验证并标记测试 clean 子集。"""
+    """仅用训练集计算 sigma 阈值；可选过滤仅作用于旧基线训练集。"""
     train_residual = data.iloc[splits["train"]][TARGET_COLUMN].to_numpy()
     residual_mean = float(np.mean(train_residual))
     residual_std = float(np.std(train_residual, ddof=0))
@@ -338,16 +381,13 @@ def build_sigma_filtered_splits(
             splits["train"][clean_mask[splits["train"]]]
             if apply_filter else splits["train"]
         ),
-        "validation": (
-            splits["validation"][clean_mask[splits["validation"]]]
-            if apply_filter else splits["validation"]
-        ),
-        # 测试集保持完整，不参与 residual 筛选。
+        # 验证集和测试集始终保持自然目标分布。
+        "validation": splits["validation"],
         "test": splits["test"],
     }
     test_clean_index = splits["test"][clean_mask[splits["test"]]]
-    if len(filtered_splits["train"]) == 0 or len(filtered_splits["validation"]) == 0:
-        raise ValueError("Sigma filtering produced an empty training or validation split")
+    if len(filtered_splits["train"]) == 0:
+        raise ValueError("Sigma filtering produced an empty training split")
     if len(test_clean_index) == 0:
         raise ValueError("Training-derived sigma bounds produced an empty clean test subset")
 
@@ -363,7 +403,7 @@ def build_sigma_filtered_splits(
         }
         action = (
             "retained without filtering"
-            if name == "test" or not apply_filter
+            if name != "train" or not apply_filter
             else "within bounds and retained for modeling"
         )
         log(
@@ -388,7 +428,7 @@ def build_sigma_filtered_splits(
         "filter_enabled": bool(apply_filter),
         "application": {
             "train": "filtered" if apply_filter else "not filtered",
-            "validation": "filtered" if apply_filter else "not filtered",
+            "validation": "never filtered; natural distribution",
             "test": "not filtered; clean subset only marked for additional evaluation",
         },
         "splits": split_summary,
@@ -402,46 +442,31 @@ def build_sigma_filtered_splits(
 
 
 def split_by_calendar_day(
-    data: pd.DataFrame, daily_sampling: pd.DataFrame, split_seed: int,
+    data: pd.DataFrame, daily_sampling: pd.DataFrame, strategy: str, split_seed: int,
     train_ratio: float, validation_ratio: float, test_ratio: float,
     output_dir: Path,
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
-    """按完整自然日随机划分，并按月份分层以维持季节覆盖。"""
+    """按完整自然日划分；默认随机分配日期，同一自然日绝不跨集合。"""
     date_frame = daily_sampling[[
         "calendar_date", "year", "day_of_year", "month",
         "rows_before_sampling", "rows_after_sampling", "realized_fraction",
     ]].copy()
     if len(date_frame) < 7:
         raise ValueError("Too few calendar days for a grouped train/validation/test split")
-    temporary_ratio = validation_ratio + test_ratio
-    try:
-        train_days, temporary_days = train_test_split(
-            date_frame,
-            train_size=train_ratio,
-            random_state=split_seed,
-            shuffle=True,
-            stratify=date_frame["month"],
-        )
-        validation_days, test_days = train_test_split(
-            temporary_days,
-            train_size=validation_ratio / temporary_ratio,
-            random_state=split_seed + 1,
-            shuffle=True,
-            stratify=temporary_days["month"],
-        )
-        stratified_by_month = True
-    except ValueError as error:
-        log(f"Monthly stratification unavailable ({error}); using unstratified day split")
-        train_days, temporary_days = train_test_split(
-            date_frame, train_size=train_ratio, random_state=split_seed, shuffle=True
-        )
-        validation_days, test_days = train_test_split(
-            temporary_days,
-            train_size=validation_ratio / temporary_ratio,
-            random_state=split_seed + 1,
-            shuffle=True,
-        )
-        stratified_by_month = False
+    date_frame = date_frame.sort_values("calendar_date").reset_index(drop=True)
+    day_count = len(date_frame)
+    train_count = int(np.floor(day_count * train_ratio))
+    validation_count = int(np.floor(day_count * validation_ratio))
+    train_count = min(max(train_count, 1), day_count - 2)
+    validation_count = min(max(validation_count, 1), day_count - train_count - 1)
+    if strategy == "random-day":
+        order = np.random.default_rng(split_seed).permutation(day_count)
+        ordered = date_frame.iloc[order].reset_index(drop=True)
+    else:
+        ordered = date_frame
+    train_days = ordered.iloc[:train_count]
+    validation_days = ordered.iloc[train_count:train_count + validation_count]
+    test_days = ordered.iloc[train_count + validation_count:]
 
     assignments = []
     for split_name, split_days in (
@@ -475,22 +500,20 @@ def split_by_calendar_day(
         raise RuntimeError(f"DOY split assigned {assigned_rows:,}/{total:,} rows")
 
     row_assignments = pd.DataFrame({
-        "calendar_date": data["datetime"].dt.normalize(), "split": row_split,
+        "original_row_index": data[ORIGINAL_ROW_COLUMN].to_numpy(),
+        "source_file_id": data[SOURCE_FILE_COLUMN].to_numpy(),
+        "source_row_number": data[SOURCE_ROW_COLUMN].to_numpy(),
+        "calendar_date": data["datetime"].dt.normalize(),
+        "split": row_split,
     })
     if row_assignments.groupby("calendar_date")["split"].nunique().max() != 1:
         raise RuntimeError("At least one calendar date was assigned to multiple splits")
+    row_assignments.to_csv(output_dir / "split_assignments.csv", index=False)
     day_assignments["calendar_date"] = day_assignments["calendar_date"].dt.strftime("%Y-%m-%d")
     day_assignments.to_csv(output_dir / "day_assignments.csv", index=False)
-    monthly_summary = pd.crosstab(day_assignments["month"], day_assignments["split"])
-    monthly_summary = monthly_summary.reindex(
-        columns=["train", "validation", "test"], fill_value=0
-    )
-    monthly_summary.to_csv(output_dir / "monthly_day_split_summary.csv")
-
     log(
-        "Dataset split: random complete-calendar-day assignment with ratios "
-        f"{train_ratio:g}/{validation_ratio:g}/{test_ratio:g}; seed={split_seed}; "
-        f"monthly stratification={'enabled' if stratified_by_month else 'fallback disabled'}"
+        f"Dataset split: {strategy} complete-calendar-day assignment with target ratios "
+        f"{train_ratio:g}/{validation_ratio:g}/{test_ratio:g}; seed={split_seed}"
     )
     for name, index in splits.items():
         split_dates = data.iloc[index]["datetime"].dt.normalize()
@@ -502,11 +525,79 @@ def split_by_calendar_day(
     return splits, day_assignments
 
 
+def fit_target_diagnostics(y_train_raw: np.ndarray) -> dict[str, object]:
+    """只用未筛选的训练目标拟合分位数、sigma 和 IQR 诊断边界。"""
+    quantile_values = np.quantile(y_train_raw, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
+    q01, q05, q25, q50, q75, q95, q99 = map(float, quantile_values)
+    mean = float(np.mean(y_train_raw))
+    std = float(np.std(y_train_raw, ddof=0))
+    iqr = q75 - q25
+    return {
+        "fit_split": "raw train only",
+        "n": int(len(y_train_raw)),
+        "mean": mean,
+        "population_std": std,
+        "quantiles": {
+            "q01": q01, "q05": q05, "q25": q25, "q50": q50,
+            "q75": q75, "q95": q95, "q99": q99,
+        },
+        "iqr": iqr,
+        "iqr_bounds": {"lower": q25 - 1.5 * iqr, "upper": q75 + 1.5 * iqr},
+        "sigma_3_bounds": {"lower": mean - 3.0 * std, "upper": mean + 3.0 * std},
+    }
+
+
+def tail_segment_labels(y: np.ndarray, quantiles: dict[str, float]) -> np.ndarray:
+    """用训练集固定的 q01/q05/q95/q99 生成五个互斥尾部分段。"""
+    return np.select(
+        [
+            y < quantiles["q01"],
+            y < quantiles["q05"],
+            y <= quantiles["q95"],
+            y <= quantiles["q99"],
+        ],
+        TAIL_SEGMENTS[:4],
+        default=TAIL_SEGMENTS[4],
+    )
+
+
+def make_sample_weights(
+    y_train: np.ndarray, quantiles: dict[str, float], scheme: str, cap: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """建立温和训练权重并归一化为均值 1；验证和测试不加权。"""
+    central, moderate, extreme = WEIGHT_LEVELS[scheme]
+    labels = tail_segment_labels(y_train, quantiles)
+    weights = np.full(len(y_train), central, dtype=np.float32)
+    weights[np.isin(labels, ("low", "high"))] = moderate
+    weights[np.isin(labels, ("extreme_low", "extreme_high"))] = extreme
+    np.minimum(weights, cap, out=weights)
+    weights /= np.mean(weights, dtype=np.float64)
+    if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+        raise RuntimeError("Training sample weights must be finite and strictly positive")
+    if not np.isclose(float(np.mean(weights)), 1.0, atol=1e-6):
+        raise RuntimeError("Normalized training sample weights do not have mean 1")
+    counts = {segment: int(np.sum(labels == segment)) for segment in TAIL_SEGMENTS}
+    summary = {
+        "scheme": scheme,
+        "raw_levels": {"central": central, "moderate_tail": moderate, "extreme_tail": extreme},
+        "normalization": "divide by training-weight mean",
+        "raw_weight_cap": float(cap),
+        "minimum": float(weights.min()),
+        "maximum": float(weights.max()),
+        "mean": float(weights.mean()),
+        "counts_by_tail_segment": counts,
+    }
+    return weights, summary
+
+
 def base_parameters(args: argparse.Namespace) -> dict[str, object]:
     """生成XGBoost模型的基础参数配置。"""
     return {
         "objective": "reg:squarederror", "eval_metric": "rmse",
         "booster": "gbtree", "tree_method": "hist",
+        "n_estimators": args.n_estimators,
+        "reg_alpha": args.reg_alpha,
+        "reg_lambda": args.reg_lambda,
         "random_state": args.model_seed, "n_jobs": args.n_jobs, "verbosity": 0,
     }
 
@@ -514,29 +605,37 @@ def base_parameters(args: argparse.Namespace) -> dict[str, object]:
 def fit_with_early_stopping(
     params: dict[str, object], x_train: np.ndarray, y_train: np.ndarray,
     x_validation: np.ndarray, y_validation: np.ndarray, rounds: int,
+    sample_weight: np.ndarray | None = None,
 ) -> xgb.XGBRegressor:
     """使用早停策略训练XGBoost回归模型，兼容不同版本的XGBoost API。"""
     eval_set = [(x_train, y_train), (x_validation, y_validation)]
     if rounds == 0:
         model = xgb.XGBRegressor(**params)
-        model.fit(x_train, y_train, eval_set=eval_set, verbose=False)
+        model.fit(
+            x_train, y_train, sample_weight=sample_weight,
+            eval_set=eval_set, verbose=False,
+        )
         return model
     model = xgb.XGBRegressor(**params)
     try:
         model.fit(
-            x_train, y_train, eval_set=eval_set,
+            x_train, y_train, sample_weight=sample_weight, eval_set=eval_set,
             early_stopping_rounds=rounds, verbose=False,
         )
     except TypeError:
         # XGBoost >= 2.1 moved early_stopping_rounds into the constructor.
         model = xgb.XGBRegressor(**params, early_stopping_rounds=rounds)
-        model.fit(x_train, y_train, eval_set=eval_set, verbose=False)
+        model.fit(
+            x_train, y_train, sample_weight=sample_weight,
+            eval_set=eval_set, verbose=False,
+        )
     return model
 
 
 def optimize_parameters(
     args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarray,
     x_validation: np.ndarray, y_validation: np.ndarray,
+    sample_weight: np.ndarray | None,
 ) -> optuna.Study:
     """使用Optuna框架进行XGBoost超参数调优，通过验证集RMSE最小化。"""
     fixed = base_parameters(args)
@@ -544,22 +643,17 @@ def optimize_parameters(
     def objective(trial: optuna.Trial) -> float:
         params = {
             **fixed,
-            "n_estimators": trial.suggest_int(
-                "n_estimators", args.min_estimators, args.max_estimators
-            ),
-            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
             "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 20.0, log=True),
             "subsample": trial.suggest_float("subsample", 0.6, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
             "gamma": trial.suggest_float("gamma", 1e-8, 1.0, log=True),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 100.0, log=True),
             "max_bin": trial.suggest_categorical("max_bin", [128, 256, 512]),
         }
         model = fit_with_early_stopping(
             params, x_train, y_train, x_validation, y_validation,
-            args.early_stopping_rounds,
+            args.early_stopping_rounds, sample_weight,
         )
         prediction = model.predict(x_validation)
         score = float(np.sqrt(mean_squared_error(y_validation, prediction)))
@@ -594,17 +688,129 @@ def optimize_parameters(
 
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """计算回归模型的评估指标（RMSE、MAE、R2、平均误差、误差标准差）。"""
+    """计算自然频率下的整体或分段回归指标。"""
     r2 = float("nan")
+    pearson = float("nan")
+    calibration_slope = float("nan")
+    calibration_intercept = float("nan")
+    observed_range = float(np.ptp(y_true))
     if len(y_true) >= 2 and not np.isclose(np.var(y_true), 0.0):
         r2 = float(r2_score(y_true, y_pred))
+        pearson = float(np.corrcoef(y_true, y_pred)[0, 1])
+        calibration_slope, calibration_intercept = map(
+            float, np.polyfit(y_true, y_pred, 1)
+        )
+    errors = y_pred - y_true
+    absolute_errors = np.abs(errors)
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "r2": r2,
-        "mean_error": float(np.mean(y_pred - y_true)),
-        "error_std": float(np.std(y_pred - y_true)),
+        "pearson": pearson,
+        "bias": float(np.mean(errors)),
+        "mean_error": float(np.mean(errors)),
+        "median_error": float(np.median(errors)),
+        "absolute_error_p90": float(np.quantile(absolute_errors, 0.90)),
+        "absolute_error_p95": float(np.quantile(absolute_errors, 0.95)),
+        "error_std": float(np.std(errors)),
+        "true_mean": float(np.mean(y_true)),
+        "pred_mean": float(np.mean(y_pred)),
+        "mean_difference": float(np.mean(y_pred) - np.mean(y_true)),
+        "true_min": float(np.min(y_true)),
+        "true_max": float(np.max(y_true)),
+        "pred_min": float(np.min(y_pred)),
+        "pred_max": float(np.max(y_pred)),
+        "range_ratio": float(np.ptp(y_pred) / observed_range) if observed_range else float("nan"),
+        "calibration_slope": calibration_slope,
+        "calibration_intercept": calibration_intercept,
     }
+
+
+def build_tail_diagnostics(
+    split_indices: dict[str, np.ndarray], y_values: np.ndarray,
+    predictions: dict[str, np.ndarray], quantiles: dict[str, float],
+) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, dict[str, float]]]:
+    """按训练分位数评估五段，并计算每个集合的等权宏平均。"""
+    rows: list[dict[str, object]] = []
+    labels_by_split: dict[str, np.ndarray] = {}
+    macro: dict[str, dict[str, float]] = {}
+    metric_names = ("rmse", "mae", "bias")
+    for split_name, split_index in split_indices.items():
+        true = y_values[split_index]
+        pred = predictions[split_name]
+        labels = tail_segment_labels(true, quantiles)
+        labels_by_split[split_name] = labels
+        segment_metrics: list[dict[str, float]] = []
+        if sum(int(np.sum(labels == value)) for value in TAIL_SEGMENTS) != len(true):
+            raise RuntimeError(f"Tail segments do not cover the {split_name} split")
+        for segment in TAIL_SEGMENTS:
+            mask = labels == segment
+            count = int(mask.sum())
+            row: dict[str, object] = {
+                "split": split_name,
+                "segment": segment,
+                "n_samples": count,
+                "sample_ratio": count / len(true),
+            }
+            if count:
+                values = regression_metrics(true[mask], pred[mask])
+                row.update(values)
+                segment_metrics.append(values)
+            rows.append(row)
+        macro[split_name] = {
+            f"macro_{metric}": float(np.mean([item[metric] for item in segment_metrics]))
+            for metric in metric_names
+        }
+    return pd.DataFrame(rows), labels_by_split, macro
+
+
+def save_tail_metric_figure(diagnostics: pd.DataFrame, output_dir: Path) -> None:
+    """保存验证集和测试集的五段 RMSE/MAE/Bias 对比图。"""
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+    x = np.arange(len(TAIL_SEGMENTS))
+    width = 0.36
+    for offset, split_name in enumerate(("validation", "test")):
+        subset = diagnostics.loc[diagnostics["split"] == split_name].set_index("segment")
+        for axis, metric in zip(axes, ("rmse", "mae", "bias")):
+            axis.bar(
+                x + (offset - 0.5) * width,
+                subset.reindex(TAIL_SEGMENTS)[metric],
+                width,
+                label=split_name,
+            )
+    for axis, title in zip(axes, ("RMSE", "MAE", "Bias (pred - true)")):
+        axis.set_xticks(x, ("<q01", "q01-q05", "q05-q95", "q95-q99", ">q99"), rotation=20)
+        axis.set_title(title)
+        axis.grid(True, axis="y", linestyle="--", alpha=0.3)
+        axis.legend()
+    fig.suptitle("Metrics by training-derived target quantiles")
+    fig.tight_layout()
+    fig.savefig(output_dir / "tail_segment_metrics.png", dpi=200)
+    plt.close(fig)
+
+
+def save_prediction_files(
+    data: pd.DataFrame, split_indices: dict[str, np.ndarray], y_values: np.ndarray,
+    predictions: dict[str, np.ndarray], output_dir: Path,
+) -> None:
+    """为三个集合保存可按原始行 ID 回连的预测明细。"""
+    frames = []
+    for split_name, split_index in split_indices.items():
+        true = y_values[split_index]
+        pred = predictions[split_name]
+        frames.append(pd.DataFrame({
+            "original_row_index": data.iloc[split_index][ORIGINAL_ROW_COLUMN].to_numpy(),
+            "source_file_id": data.iloc[split_index][SOURCE_FILE_COLUMN].to_numpy(),
+            "source_row_number": data.iloc[split_index][SOURCE_ROW_COLUMN].to_numpy(),
+            "split": split_name,
+            "true_residual": true,
+            "predicted_residual": pred,
+            "prediction_error": pred - true,
+            "absolute_error": np.abs(pred - true),
+        }))
+    pd.concat(frames, ignore_index=True).to_csv(
+        output_dir / "all_split_predictions.csv", index=False
+    )
 
 
 def sigma_segment_labels(z_score: np.ndarray) -> np.ndarray:
@@ -861,12 +1067,15 @@ def save_test_figure(
     y_true: np.ndarray, y_pred: np.ndarray, output_path: Path,
     maximum_points: int, seed: int,
 ) -> None:
-    """绘制测试集的预测性能图表，包括预测值vs真实值散点图和误差分布直方图。"""
+    """绘制测试集真实-预测、误差-真实及误差分布诊断图。"""
     plot_idx = select_plot_indices(len(y_true), maximum_points, seed)
     errors = y_pred - y_true
     metrics = regression_metrics(y_true, y_pred)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].scatter(y_true[plot_idx], y_pred[plot_idx], s=8, alpha=0.2)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+    density = axes[0].hexbin(
+        y_true[plot_idx], y_pred[plot_idx], gridsize=80, mincnt=1, bins="log"
+    )
+    fig.colorbar(density, ax=axes[0], label="log10(count)")
     bounds = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
     axes[0].plot(bounds, bounds, "r--", lw=1.5)
     axes[0].set_xlabel("True residual")
@@ -874,11 +1083,19 @@ def save_test_figure(
     axes[0].set_title(
         f"Test prediction (RMSE={metrics['rmse']:.5f}, R2={metrics['r2']:.4f})"
     )
-    axes[1].hist(errors, bins=50, color="#2ca02c", alpha=0.75)
-    axes[1].axvline(0, color="red", linestyle="--")
-    axes[1].set_xlabel("Prediction error (predicted - true)")
-    axes[1].set_ylabel("Count")
-    axes[1].set_title("Test error distribution")
+    error_density = axes[1].hexbin(
+        y_true[plot_idx], errors[plot_idx], gridsize=80, mincnt=1, bins="log"
+    )
+    fig.colorbar(error_density, ax=axes[1], label="log10(count)")
+    axes[1].axhline(0, color="red", linestyle="--")
+    axes[1].set_xlabel("True residual")
+    axes[1].set_ylabel("Prediction error (predicted - true)")
+    axes[1].set_title("Error vs true residual")
+    axes[2].hist(errors, bins=50, color="#2ca02c", alpha=0.75)
+    axes[2].axvline(0, color="red", linestyle="--")
+    axes[2].set_xlabel("Prediction error (predicted - true)")
+    axes[2].set_ylabel("Count")
+    axes[2].set_title("Test error distribution")
     for axis in axes:
         axis.grid(True, linestyle="--", alpha=0.35)
     fig.tight_layout()
@@ -948,9 +1165,12 @@ def main() -> int:
         for number, path in enumerate(files)
     ]).to_csv(args.output_dir / "input_file_manifest.csv", index=False)
     data = load_csv_files(files, args.csv_engine, args.read_batch_size)
-    data, feature_columns, fixed_altitude, original_altitude = clean_and_validate(
-        data, args.fixed_altitude
-    )
+    (
+        data, feature_columns, fixed_altitude, original_altitude,
+        qc_log, qc_removed_records,
+    ) = clean_and_validate(data, args.fixed_altitude)
+    pd.DataFrame([qc_log]).to_csv(args.output_dir / "qc_summary.csv", index=False)
+    qc_removed_records.to_csv(args.output_dir / "qc_removed_records.csv", index=False)
     data, sampling_summary, daily_sampling = sample_rows_within_days(
         data, args.sample_fraction, args.sample_seed
     )
@@ -958,35 +1178,66 @@ def main() -> int:
     if args.save_eda:
         save_eda_figures(data, args.output_dir)
 
-    # 先按时间排序以保持输出稳定，再把完整自然日随机分配到三个集合。
+    forbidden_features = {
+        TARGET_COLUMN, "is_3sigma", "is_iqr_outlier", "tail_segment", "sample_weight"
+    }
+    leaked_features = sorted(forbidden_features.intersection(feature_columns))
+    if leaked_features:
+        raise RuntimeError(f"Target-derived columns cannot be model features: {leaked_features}")
+
+    # 先按时间排序以保证输出稳定，再随机分配不可拆分的完整自然日。
     data_sorted = data.sort_values("datetime").reset_index(drop=False)
     original_indices = data_sorted[ORIGINAL_ROW_COLUMN].to_numpy()
     data_sorted = data_sorted.reset_index(drop=True)
-    raw_indices, day_assignments = split_by_calendar_day(
-        data_sorted, daily_sampling, args.split_seed,
+    indices, _day_assignments = split_by_calendar_day(
+        data_sorted, daily_sampling, args.split_strategy, args.split_seed,
         args.train_ratio, args.validation_ratio, args.test_ratio,
         args.output_dir,
     )
-    indices, test_clean_index, sigma_filter = build_sigma_filtered_splits(
-        data_sorted, raw_indices, args.outlier_sigma, args.sigma_filter
-    )
     x_values = data_sorted[feature_columns].to_numpy(dtype=np.float32)
     y_values = data_sorted[TARGET_COLUMN].to_numpy(dtype=np.float32)
+    if np.any(y_values < 0):
+        raise RuntimeError("Hard QC failed: residual < 0 remains after cleaning")
+    split_summary_rows = []
+    for split_name, split_index in indices.items():
+        split_frame = data_sorted.iloc[split_index]
+        row: dict[str, object] = {
+            "split": split_name,
+            "rows": int(len(split_index)),
+            "calendar_days": int(split_frame["datetime"].dt.normalize().nunique()),
+            "start_time": split_frame["datetime"].min().isoformat(),
+            "end_time": split_frame["datetime"].max().isoformat(),
+            "latitude_min": float(split_frame["lat"].min()),
+            "latitude_max": float(split_frame["lat"].max()),
+            "longitude_min": float(split_frame["lon"].min()),
+            "longitude_max": float(split_frame["lon"].max()),
+        }
+        row.update(_distribution_statistics("residual", y_values[split_index]))
+        split_summary_rows.append(row)
+    pd.DataFrame(split_summary_rows).to_csv(
+        args.output_dir / "split_summary.csv", index=False
+    )
     x_train, y_train = x_values[indices["train"]], y_values[indices["train"]]
     x_validation, y_validation = (
         x_values[indices["validation"]], y_values[indices["validation"]]
     )
 
-    study = optimize_parameters(args, x_train, y_train, x_validation, y_validation)
+    study = optimize_parameters(
+        args, x_train, y_train, x_validation, y_validation, None
+    )
     study.trials_dataframe().to_csv(args.output_dir / "optuna_trials.csv", index=False)
     with (args.output_dir / "best_params.json").open("w", encoding="utf-8") as handle:
         json.dump(study.best_params, handle, ensure_ascii=False, indent=2)
 
     final_params = {**base_parameters(args), **study.best_params}
-    log(f"Training selected model with parameters: {study.best_params}")
+    log(
+        "Training selected model with "
+        f"n_estimators={args.n_estimators}, reg_alpha={args.reg_alpha}, "
+        f"reg_lambda={args.reg_lambda}, tuned parameters={study.best_params}"
+    )
     model = fit_with_early_stopping(
         final_params, x_train, y_train, x_validation, y_validation,
-        args.early_stopping_rounds,
+        args.early_stopping_rounds, None,
     )
     history = save_training_history(model, args.output_dir)
     model.save_model(args.output_dir / "xg_jason_ion_model.json")
@@ -997,8 +1248,7 @@ def main() -> int:
     evaluation_indices = {
         "train": indices["train"],
         "validation": indices["validation"],
-        "test_full": indices["test"],
-        "test_clean": test_clean_index,
+        "test": indices["test"],
     }
     for name, split_index in evaluation_indices.items():
         prediction = model.predict(x_values[split_index])
@@ -1009,60 +1259,30 @@ def main() -> int:
             f"MAE={evaluations[name]['mae']:.6f}, R2={evaluations[name]['r2']:.6f}"
         )
 
-    raw_predictions = {
+    predictions = {
         name: model.predict(x_values[split_index])
-        for name, split_index in raw_indices.items()
+        for name, split_index in indices.items()
     }
-    sigma_diagnostics, labels_by_split, z_scores_by_split = build_sigma_diagnostics(
-        raw_indices, y_values, raw_predictions,
-        float(sigma_filter["mean"]), float(sigma_filter["population_std"]),
+    save_prediction_files(
+        data_sorted, indices, y_values, predictions, args.output_dir,
     )
-    sigma_diagnostics.to_csv(args.output_dir / "sigma_segment_metrics.csv", index=False)
-    for row in sigma_diagnostics.itertuples(index=False):
-        log(
-            f"sigma diagnostic {row.split}/{row.segment}: n={row.n_samples:,} "
-            f"({row.sample_ratio:.2%}), RMSE={row.rmse:.6f}, "
-            f"MAE={row.mae:.6f}, R2={row.r2:.6f}"
-        )
-    save_sigma_diagnostic_figures(
-        sigma_diagnostics, raw_indices, y_values, raw_predictions,
-        labels_by_split, z_scores_by_split, args.output_dir,
-        args.max_scatter_points, args.model_seed,
-    )
-    if args.export_extremes:
-        export_extreme_rows(
-            data_sorted, files, raw_indices, y_values, raw_predictions,
-            labels_by_split, z_scores_by_split, args.output_dir,
-        )
 
     test_index = indices["test"]
-    test_clean_mask = np.isin(test_index, test_clean_index)
     test_predictions_frame = pd.DataFrame({
         "original_row_index": original_indices[test_index],
         "source_file_id": data_sorted.iloc[test_index][SOURCE_FILE_COLUMN].to_numpy(),
         "source_row_number": data_sorted.iloc[test_index][SOURCE_ROW_COLUMN].to_numpy(),
         "true_residual": y_values[test_index],
-        "predicted_residual": predictions["test_full"],
-        "prediction_error": predictions["test_full"] - y_values[test_index],
-        "absolute_error": np.abs(predictions["test_full"] - y_values[test_index]),
-        "residual_z_score": z_scores_by_split["test"],
-        "sigma_segment": labels_by_split["test"],
-        "is_clean_by_training_sigma": test_clean_mask,
+        "predicted_residual": predictions["test"],
+        "prediction_error": predictions["test"] - y_values[test_index],
+        "absolute_error": np.abs(predictions["test"] - y_values[test_index]),
     })
     test_predictions_frame.to_csv(
         args.output_dir / "test_predictions.csv", index=False
     )
-    test_predictions_frame.loc[test_clean_mask].to_csv(
-        args.output_dir / "test_clean_predictions.csv", index=False
-    )
     save_test_figure(
-        y_values[test_index], predictions["test_full"],
+        y_values[test_index], predictions["test"],
         args.output_dir / "test_performance.png",
-        args.max_scatter_points, args.model_seed,
-    )
-    save_test_figure(
-        y_values[test_clean_index], predictions["test_clean"],
-        args.output_dir / "test_clean_performance.png",
         args.max_scatter_points, args.model_seed,
     )
 
@@ -1075,8 +1295,8 @@ def main() -> int:
         "valid_row_count_before_sampling": sampling_summary["rows_before_sampling"],
         "analyzed_row_count": len(data),
         "sampling": sampling_summary,
-        "residual_sigma_filter": sigma_filter,
-        "split_method": "random complete-calendar-day split stratified by month",
+        "hard_qc": qc_log,
+        "split_method": f"{args.split_strategy} complete-calendar-day split",
         "split_ratio_target": {
             "train": args.train_ratio,
             "validation": args.validation_ratio,
@@ -1085,25 +1305,22 @@ def main() -> int:
         "split_rule": {
             "grouping_unit": "calendar date",
             "assignment_seed": args.split_seed,
-            "stratification": "calendar month when feasible",
+            "strategy": args.split_strategy,
             "same_day_cross_split_allowed": False,
-            "assignment_file": "day_assignments.csv",
-        },
-        "split_rows_before_sigma": {
-            name: len(value) for name, value in raw_indices.items()
+            "day_assignment_file": "day_assignments.csv",
+            "row_assignment_file": "split_assignments.csv",
         },
         "model_split_rows": {
             "train": len(indices["train"]),
             "validation": len(indices["validation"]),
-            "test_full": len(indices["test"]),
-            "test_clean": len(test_clean_index),
+            "test": len(indices["test"]),
         },
         "split_row_ratios": {
-            name: len(value) / len(data_sorted) for name, value in raw_indices.items()
+            name: len(value) / len(data_sorted) for name, value in indices.items()
         },
         "split_calendar_days": {
             name: int(data_sorted.iloc[index]["datetime"].dt.normalize().nunique())
-            for name, index in raw_indices.items()
+            for name, index in indices.items()
         },
         "date_coverage": {
             name: {
@@ -1114,13 +1331,17 @@ def main() -> int:
                     data_sorted.iloc[index]["datetime"].dt.normalize().max().date()
                 ),
             }
-            for name, index in raw_indices.items()
+            for name, index in indices.items()
         },
         "model_seed": args.model_seed,
         "sample_seed": args.sample_seed,
         "split_seed": args.split_seed,
-        "sigma_filter_enabled": args.sigma_filter,
-        "extreme_rows_exported": args.export_extremes,
+        "target_qc": "residual < 0 removed before sampling and splitting",
+        "regularization": {
+            "l1_reg_alpha": args.reg_alpha,
+            "l2_reg_lambda": args.reg_lambda,
+        },
+        "maximum_boosting_rounds": args.n_estimators,
         "time_features": {
             "source_datetime_timezone": "UTC",
             "local_solar_hour_formula": "(UTC fractional hour + longitude / 15) modulo 24",
