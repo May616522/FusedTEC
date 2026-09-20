@@ -9,12 +9,13 @@
 #SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/jason2021/xg_jason_ion_%j.err
 
 # Slurm job file for xg_Jason_ion.py.
-# Trains an XGBoost model for Jason ionospheric residuals using a reproducible
+# Trains an XGBoost model that directly predicts GIM VTEC from TEC_smooth and
+# the existing spatial, temporal, solar and geomagnetic features, using a reproducible
 # random complete-calendar-day split. All valid rows are retained before
 # complete calendar days are assigned to train/validation/test.
 # Complete days are randomly assigned 70%/15%/15% to train/validation/test;
-# every row from one day stays in exactly one split. Rows with residual < 0 are
-# removed before sampling and splitting. The model uses at most 300 boosting
+# every row from one day stays in exactly one split. Only rows with residual > 0
+# are retained before sampling and splitting. The model uses at most 300 boosting
 # rounds with early stopping, plus explicit L1 and L2 regularization.
 # Local solar-time sine/cosine replace UTC HOD sine/cosine.
 # If your cluster requires them, also add its #SBATCH --partition and
@@ -31,9 +32,22 @@ INPUT_DIR="/share/home/u23114/tj23114/data/Yaoyaping_data/jason2021"
 
 # Each Slurm job gets an independent directory so an earlier result cannot be
 # overwritten accidentally.
-EXPERIMENT_NAME="full_data_random_day_residual_nonnegative_regularized_300rounds"
+EXPERIMENT_NAME="direct_gim_vtec_from_tec_smooth_residual_positive_300rounds"
 RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
+
+# Set EVALUATION_ONLY=1 and EXISTING_RUN_DIR to an earlier result directory to
+# recalculate direct GIM prediction metrics without Optuna or model training. For example:
+# sbatch --export=ALL,EVALUATION_ONLY=1,EXISTING_RUN_DIR=/path/to/old/run xg_Jason_ion.sh
+EVALUATION_ONLY="${EVALUATION_ONLY:-0}"
+EXISTING_RUN_DIR="${EXISTING_RUN_DIR:-}"
+if [[ "${EVALUATION_ONLY}" == "1" ]]; then
+    if [[ -z "${EXISTING_RUN_DIR}" || ! -d "${EXISTING_RUN_DIR}" ]]; then
+        echo "ERROR: evaluation mode requires an existing EXISTING_RUN_DIR." >&2
+        exit 2
+    fi
+    OUTPUT_DIR="${EXISTING_RUN_DIR}"
+fi
 
 # Fixed Jason orbital altitude, in the same unit as the CSV alt column. This
 # is the median of the local 2021 data (original range: 1339.02 to 1356.56).
@@ -81,12 +95,14 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     exit 2
 fi
 
-if [[ ! -d "${INPUT_DIR}" ]]; then
+if [[ "${EVALUATION_ONLY}" != "1" && ! -d "${INPUT_DIR}" ]]; then
     echo "ERROR: Input directory does not exist: ${INPUT_DIR}" >&2
     exit 2
 fi
 
-mkdir -p "${OUTPUT_DIR}"
+if [[ "${EVALUATION_ONLY}" != "1" ]]; then
+    mkdir -p "${OUTPUT_DIR}"
+fi
 
 if ! "${PYTHON_BIN}" -c "import matplotlib, numpy, optuna, pandas, sklearn, xgboost"; then
     echo "ERROR: The selected Python environment is missing required packages." >&2
@@ -102,43 +118,53 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Host: $(hostname)"
-echo "Input: ${INPUT_DIR}"
 echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
-echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
-echo "Experiment: ${EXPERIMENT_NAME}"
-echo "Within-day sampling fraction: ${SAMPLE_FRACTION}; all valid rows retained"
-echo "Random whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
-echo "Calendar-day constraint: every row from one day stays in exactly one split"
-echo "Target QC: residual < 0 removed before sampling and splitting"
-echo "Training: max ${N_ESTIMATORS} rounds, early stopping=${EARLY_STOPPING_ROUNDS}"
-echo "Regularization: L1 reg_alpha=${REG_ALPHA}; L2 reg_lambda=${REG_LAMBDA}"
-echo "Additional model feature: gim_vtec"
-echo "Time features: local solar-time sine/cosine computed from UTC datetime and longitude"
+if [[ "${EVALUATION_ONLY}" == "1" ]]; then
+    echo "Mode: evaluation only (no retraining)"
+    COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
+        --output-dir "${OUTPUT_DIR}" \
+        --evaluation-only)
+else
+    echo "Mode: training"
+    echo "Input: ${INPUT_DIR}"
+    echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
+    echo "Experiment: ${EXPERIMENT_NAME}"
+    echo "Within-day sampling fraction: ${SAMPLE_FRACTION}; all valid rows retained"
+    echo "Random whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
+    echo "Calendar-day constraint: every row from one day stays in exactly one split"
+    echo "Row filter: retain only residual > 0 before sampling and splitting"
+    echo "Training: max ${N_ESTIMATORS} rounds, early stopping=${EARLY_STOPPING_ROUNDS}"
+    echo "Regularization: L1 reg_alpha=${REG_ALPHA}; L2 reg_lambda=${REG_LAMBDA}"
+    echo "Target: gim_vtec"
+    echo "Core observation feature: TEC_smooth"
+    echo "Leakage exclusions: gim_vtec and residual are never model features"
+    echo "Time features: local solar-time sine/cosine computed from UTC datetime and longitude"
 
-COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
-    --input-dir "${INPUT_DIR}" \
-    --output-dir "${OUTPUT_DIR}" \
-    --fixed-altitude "${FIXED_ALTITUDE}" \
-    --sample-fraction "${SAMPLE_FRACTION}" \
-    --sample-seed "${SAMPLE_SEED}" \
-    --split-strategy random-day \
-    --split-seed "${SPLIT_SEED}" \
-    --train-ratio "${TRAIN_RATIO}" \
-    --validation-ratio "${VALIDATION_RATIO}" \
-    --test-ratio "${TEST_RATIO}" \
-    --n-trials "${N_TRIALS}" \
-    --optuna-timeout "${OPTUNA_TIMEOUT}" \
-    --n-estimators "${N_ESTIMATORS}" \
-    --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}" \
-    --reg-alpha "${REG_ALPHA}" \
-    --reg-lambda "${REG_LAMBDA}" \
-    --model-seed "${MODEL_SEED}" \
-    --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
+    COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
+        --input-dir "${INPUT_DIR}" \
+        --output-dir "${OUTPUT_DIR}" \
+        --fixed-altitude "${FIXED_ALTITUDE}" \
+        --sample-fraction "${SAMPLE_FRACTION}" \
+        --sample-seed "${SAMPLE_SEED}" \
+        --split-strategy random-day \
+        --split-seed "${SPLIT_SEED}" \
+        --train-ratio "${TRAIN_RATIO}" \
+        --validation-ratio "${VALIDATION_RATIO}" \
+        --test-ratio "${TEST_RATIO}" \
+        --n-trials "${N_TRIALS}" \
+        --optuna-timeout "${OPTUNA_TIMEOUT}" \
+        --n-estimators "${N_ESTIMATORS}" \
+        --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}" \
+        --reg-alpha "${REG_ALPHA}" \
+        --reg-lambda "${REG_LAMBDA}" \
+        --model-seed "${MODEL_SEED}" \
+        --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
+fi
 
 printf 'Command:'
 printf ' %q' "${COMMAND[@]}"
 printf '\n'
 srun "${COMMAND[@]}"
 
-echo "Training completed successfully."
+echo "Job completed successfully."

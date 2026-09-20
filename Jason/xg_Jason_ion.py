@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Tune, train and audit the Jason ionospheric-residual XGBoost model.
+"""Tune, train and audit a direct GIM VTEC XGBoost model.
 
 The default workflow keeps statistically rare targets and randomly assigns
 complete calendar days to train/validation/test. A calendar day is an
 indivisible group: all rows from that day must stay in exactly one split.
-Every target threshold is fitted on the training split only, and validation/test
-are evaluated at their natural frequency.
-Rows whose residual is negative are removed by the documented hard-QC rule
+The target is ``gim_vtec``. ``TEC_smooth`` is an input feature together with
+the existing spatial, temporal and space-weather predictors. Both ``gim_vtec``
+and the algebraically related ``residual`` are forbidden as model features.
+Only rows satisfying the documented hard-QC rule ``residual > 0`` are retained
 before sampling and splitting.
 """
 
@@ -34,14 +35,15 @@ from optuna.samplers import TPESampler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
-TARGET_COLUMN = "residual"
+TARGET_COLUMN = "gim_vtec"
+FILTER_COLUMN = "residual"
 SOURCE_FILE_COLUMN = "__source_file_id"
 SOURCE_ROW_COLUMN = "__source_row_number"
 ORIGINAL_ROW_COLUMN = "__cleaned_row_index"
 LOCAL_TIME_SIN_COLUMN = "local_time_s"
 LOCAL_TIME_COS_COLUMN = "local_time_c"
 EXCLUDED_COLUMNS = {
-    "datetime", TARGET_COLUMN, "TEC_smooth", "TEC_raw", SOURCE_FILE_COLUMN,
+    "datetime", TARGET_COLUMN, FILTER_COLUMN, "TEC_raw", SOURCE_FILE_COLUMN,
     SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN, "HOD_s", "HOD_c",
 }
 # Compatibility constants for the retained diagnostic helper functions. The
@@ -60,12 +62,22 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数，包括输入/输出目录、Optuna试验数量、XGBoost参数范围等。"""
     parser = argparse.ArgumentParser(
         description=(
-            "Optuna-tuned XGBoost regression for Jason residuals with a "
+            "Optuna-tuned XGBoost regression for direct GIM VTEC prediction with a "
             "leakage-safe, calendar-day-grouped train/validation/test split."
         )
     )
-    parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument(
+        "--input-dir", type=Path,
+        help="Input CSV directory; not required with --evaluation-only.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--evaluation-only", action="store_true",
+        help=(
+            "Do not train. Recalculate direct GIM prediction metrics from an "
+            "existing output directory produced by this workflow."
+        ),
+    )
     parser.add_argument("--pattern", default="*.csv")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--csv-engine", choices=("c", "python", "pyarrow"), default="c")
@@ -135,6 +147,8 @@ def log(message: str) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     """验证命令行参数的有效性，确保数值范围合理。"""
+    if not args.evaluation_only and args.input_dir is None:
+        raise ValueError("--input-dir is required unless --evaluation-only is used")
     if args.n_trials < 1:
         raise ValueError("--n-trials must be at least 1")
     if args.optuna_timeout < 0:
@@ -258,8 +272,10 @@ def clean_and_validate(
 ) -> tuple[
     pd.DataFrame, list[str], float, dict[str, float], dict[str, object], pd.DataFrame
 ]:
-    """清理缺失/无穷值，验证数据完整性，并固定高度值。"""
-    required = {TARGET_COLUMN, "datetime", "lat", "lon", "alt", "gim_vtec"}
+    """清理缺失/无穷值，仅保留 residual > 0，并固定高度值。"""
+    required = {
+        TARGET_COLUMN, FILTER_COLUMN, "TEC_smooth", "datetime", "lat", "lon", "alt"
+    }
     missing = sorted(required.difference(data.columns))
     if missing:
         raise ValueError(f"Required columns are missing: {missing}")
@@ -276,20 +292,20 @@ def clean_and_validate(
     data.loc[:, numeric_columns] = data[numeric_columns].replace([np.inf, -np.inf], np.nan)
     rows_before = len(data)
     missing_or_nonfinite = data.isna().any(axis=1)
-    negative_target = data[TARGET_COLUMN] < 0
+    nonpositive_residual = data[FILTER_COLUMN] <= 0
     duplicate_columns = [
         column for column in data.columns
         if column not in {SOURCE_FILE_COLUMN, SOURCE_ROW_COLUMN}
     ]
     exact_duplicate = data.duplicated(subset=duplicate_columns, keep="first")
-    removed_mask = missing_or_nonfinite | exact_duplicate | negative_target
+    removed_mask = missing_or_nonfinite | exact_duplicate | nonpositive_residual
     removed_records = data.loc[
         removed_mask,
         [SOURCE_FILE_COLUMN, SOURCE_ROW_COLUMN, "datetime"],
     ].copy()
     removed_records["qc_reason"] = np.select(
-        [negative_target[removed_mask], missing_or_nonfinite[removed_mask]],
-        ["residual_below_zero", "missing_or_nonfinite"],
+        [nonpositive_residual[removed_mask], missing_or_nonfinite[removed_mask]],
+        ["residual_not_positive", "missing_or_nonfinite"],
         default="exact_duplicate",
     )
     data = data.loc[~removed_mask].reset_index(drop=True)
@@ -298,13 +314,13 @@ def clean_and_validate(
         "invalid_datetime": invalid_datetime_count,
         "missing_or_nonfinite": int(missing_or_nonfinite.sum()),
         "exact_duplicate": int(exact_duplicate.sum()),
-        "residual_below_zero": int(negative_target.sum()),
+        "residual_not_positive": int(nonpositive_residual.sum()),
         "rows_removed": int(removed_mask.sum()),
         "rows_retained": int(len(data)),
         "rules": [
             "all model fields finite/non-missing",
             "remove exact duplicate records",
-            "remove rows where residual < 0 before sampling and splitting",
+            "retain only rows where residual > 0 before sampling and splitting",
         ],
     }
     log(f"Rows before cleaning: {rows_before:,}")
@@ -339,6 +355,11 @@ def clean_and_validate(
     feature_columns = [column for column in data.columns if column not in EXCLUDED_COLUMNS]
     if not feature_columns:
         raise ValueError("No feature columns remain after exclusions")
+    if "TEC_smooth" not in feature_columns:
+        raise RuntimeError("TEC_smooth must be present as a model feature")
+    leaked_columns = sorted({TARGET_COLUMN, FILTER_COLUMN}.intersection(feature_columns))
+    if leaked_columns:
+        raise RuntimeError(f"Target-derived columns leaked into features: {leaked_columns}")
     non_numeric = [
         column for column in [*feature_columns, TARGET_COLUMN]
         if not pd.api.types.is_numeric_dtype(data[column])
@@ -364,17 +385,17 @@ def build_sigma_filtered_splits(
     data: pd.DataFrame, splits: dict[str, np.ndarray], outlier_sigma: float,
     apply_filter: bool,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, object]]:
-    """仅用训练集计算 sigma 阈值；可选过滤仅作用于旧基线训练集。"""
-    train_residual = data.iloc[splits["train"]][TARGET_COLUMN].to_numpy()
-    residual_mean = float(np.mean(train_residual))
-    residual_std = float(np.std(train_residual, ddof=0))
-    if not np.isfinite(residual_mean) or not np.isfinite(residual_std) or residual_std <= 0:
-        raise ValueError("Training residual mean/std is not finite or std is zero")
+    """仅用训练集计算目标 sigma 阈值；可选过滤仅作用于训练集。"""
+    train_target = data.iloc[splits["train"]][TARGET_COLUMN].to_numpy()
+    target_mean = float(np.mean(train_target))
+    target_std = float(np.std(train_target, ddof=0))
+    if not np.isfinite(target_mean) or not np.isfinite(target_std) or target_std <= 0:
+        raise ValueError("Training target mean/std is not finite or std is zero")
 
-    lower_bound = residual_mean - outlier_sigma * residual_std
-    upper_bound = residual_mean + outlier_sigma * residual_std
-    residual = data[TARGET_COLUMN].to_numpy()
-    clean_mask = (residual >= lower_bound) & (residual <= upper_bound)
+    lower_bound = target_mean - outlier_sigma * target_std
+    upper_bound = target_mean + outlier_sigma * target_std
+    target = data[TARGET_COLUMN].to_numpy()
+    clean_mask = (target >= lower_bound) & (target <= upper_bound)
 
     filtered_splits = {
         "train": (
@@ -414,14 +435,14 @@ def build_sigma_filtered_splits(
     sigma_filter: dict[str, object] = {
         "fit_split": "train",
         "sigma_multiplier": float(outlier_sigma),
-        "mean": residual_mean,
-        "population_std": residual_std,
+        "mean": target_mean,
+        "population_std": target_std,
         "lower_bound": float(lower_bound),
         "upper_bound": float(upper_bound),
         "diagnostic_bounds": {
             f"{level}_sigma": {
-                "lower": float(residual_mean - level * residual_std),
-                "upper": float(residual_mean + level * residual_std),
+                "lower": float(target_mean - level * target_std),
+                "upper": float(target_mean + level * target_std),
             }
             for level in (1, 2, 3)
         },
@@ -434,8 +455,8 @@ def build_sigma_filtered_splits(
         "splits": split_summary,
     }
     log(
-        f"Training-only residual {outlier_sigma:g}-sigma bounds: "
-        f"mean={residual_mean:.6f}, std={residual_std:.6f}, "
+        f"Training-only target {outlier_sigma:g}-sigma bounds: "
+        f"mean={target_mean:.6f}, std={target_std:.6f}, "
         f"bounds=[{lower_bound:.6f}, {upper_bound:.6f}]"
     )
     return filtered_splits, test_clean_index, sigma_filter
@@ -665,7 +686,7 @@ def optimize_parameters(
 
     study = optuna.create_study(
         direction="minimize", sampler=TPESampler(seed=args.model_seed),
-        study_name="xg_jason_ion_residual",
+        study_name="xg_jason_gim_vtec",
     )
 
     def progress(study: optuna.Study, trial: optuna.FrozenTrial) -> None:
@@ -724,6 +745,147 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
         "calibration_slope": calibration_slope,
         "calibration_intercept": calibration_intercept,
     }
+
+
+def evaluate_gim_prediction(
+    data: pd.DataFrame,
+    split_indices: dict[str, np.ndarray],
+    target_values: np.ndarray,
+    target_predictions: dict[str, np.ndarray],
+) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
+    """比较 TEC_smooth 直接基线和模型对 GIM VTEC 的预测表现。"""
+    expected_target = data[TARGET_COLUMN].to_numpy(dtype=np.float64)
+    target_values64 = target_values.astype(np.float64, copy=False)
+    maximum_definition_error = float(np.max(np.abs(expected_target - target_values64)))
+    if not np.allclose(
+        expected_target, target_values64, rtol=1e-5, atol=1e-4
+    ):
+        raise RuntimeError(
+            "Target definition mismatch: expected target = gim_vtec; "
+            f"maximum absolute mismatch={maximum_definition_error:.6g}"
+        )
+
+    rows: list[dict[str, object]] = []
+    summary: dict[str, dict[str, object]] = {}
+    for split_name, split_index in split_indices.items():
+        true_gim = target_values64[split_index]
+        tec_smooth_baseline = data.iloc[split_index]["TEC_smooth"].to_numpy(
+            dtype=np.float64
+        )
+        predicted_gim = target_predictions[split_name].astype(
+            np.float64, copy=False
+        )
+
+        baseline = regression_metrics(true_gim, tec_smooth_baseline)
+        model_metrics = regression_metrics(true_gim, predicted_gim)
+        improvements = {
+            "rmse_absolute_improvement": baseline["rmse"] - model_metrics["rmse"],
+            "rmse_improvement_percent": (
+                100.0 * (baseline["rmse"] - model_metrics["rmse"]) / baseline["rmse"]
+                if baseline["rmse"] else float("nan")
+            ),
+            "mae_absolute_improvement": baseline["mae"] - model_metrics["mae"],
+            "mae_improvement_percent": (
+                100.0 * (baseline["mae"] - model_metrics["mae"]) / baseline["mae"]
+                if baseline["mae"] else float("nan")
+            ),
+            "pearson_delta": model_metrics["pearson"] - baseline["pearson"],
+            "pearson_improvement_percent": (
+                100.0
+                * (model_metrics["pearson"] - baseline["pearson"])
+                / abs(baseline["pearson"])
+                if baseline["pearson"] else float("nan")
+            ),
+            "r2_delta": model_metrics["r2"] - baseline["r2"],
+            "r2_improvement_percent": (
+                100.0
+                * (model_metrics["r2"] - baseline["r2"])
+                / abs(baseline["r2"])
+                if baseline["r2"] else float("nan")
+            ),
+        }
+        for model_name, values in (
+            ("tec_smooth_baseline", baseline),
+            ("xgboost_gim_prediction", model_metrics),
+        ):
+            row: dict[str, object] = {
+                "split": split_name,
+                "model": model_name,
+                "n_samples": int(len(split_index)),
+                **values,
+            }
+            if model_name == "xgboost_gim_prediction":
+                row.update(improvements)
+            rows.append(row)
+        summary[split_name] = {
+            "n_samples": int(len(split_index)),
+            "tec_smooth_baseline": baseline,
+            "xgboost_gim_prediction": model_metrics,
+            "improvement": improvements,
+        }
+
+    summary["target_definition_check"] = {
+        "formula": "target = gim_vtec",
+        "maximum_absolute_mismatch": maximum_definition_error,
+        "passed": True,
+    }
+    return pd.DataFrame(rows), summary
+
+
+def save_gim_prediction_outputs(
+    metrics_frame: pd.DataFrame,
+    summary: dict[str, dict[str, object]],
+    output_dir: Path,
+) -> None:
+    """保存 GIM 预测指标并在日志中突出相对 TEC_smooth 基线的改善。"""
+    metrics_frame.to_csv(output_dir / "gim_prediction_metrics.csv", index=False)
+    available_splits = [
+        name for name in ("train", "validation", "test") if name in summary
+    ]
+    comparison_rows = []
+    for split_name in available_splits:
+        split_summary = summary[split_name]
+        baseline_values = split_summary["tec_smooth_baseline"]
+        model_values = split_summary["xgboost_gim_prediction"]
+        improvement_values = split_summary["improvement"]
+        comparison_rows.append({
+            "split": split_name,
+            "n_samples": split_summary["n_samples"],
+            **{
+                f"baseline_{metric}": baseline_values[metric]
+                for metric in ("rmse", "mae", "pearson", "r2")
+            },
+            **{
+                f"model_{metric}": model_values[metric]
+                for metric in ("rmse", "mae", "pearson", "r2")
+            },
+            **improvement_values,
+        })
+    pd.DataFrame(comparison_rows).to_csv(
+        output_dir / "gim_prediction_comparison.csv", index=False
+    )
+    with (output_dir / "gim_prediction_metrics.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    if "test" not in summary:
+        raise RuntimeError("GIM prediction evaluation must include a test split")
+    test = summary["test"]
+    baseline = test["tec_smooth_baseline"]
+    model_metrics = test["xgboost_gim_prediction"]
+    improvement = test["improvement"]
+    log(
+        "Test GIM baseline (TEC_smooth -> GIM): "
+        f"RMSE={baseline['rmse']:.6f}, MAE={baseline['mae']:.6f}, "
+        f"R={baseline['pearson']:.6f}, R2={baseline['r2']:.6f}"
+    )
+    log(
+        "Test direct GIM prediction: "
+        f"RMSE={model_metrics['rmse']:.6f}, MAE={model_metrics['mae']:.6f}, "
+        f"R={model_metrics['pearson']:.6f}, R2={model_metrics['r2']:.6f}; "
+        f"RMSE improvement={improvement['rmse_improvement_percent']:.2f}%, "
+        f"MAE improvement={improvement['mae_improvement_percent']:.2f}%"
+    )
 
 
 def build_tail_diagnostics(
@@ -798,15 +960,21 @@ def save_prediction_files(
     for split_name, split_index in split_indices.items():
         true = y_values[split_index]
         pred = predictions[split_name]
+        tec_smooth = data.iloc[split_index]["TEC_smooth"].to_numpy(dtype=np.float64)
+        observed_residual = data.iloc[split_index][FILTER_COLUMN].to_numpy(dtype=np.float64)
         frames.append(pd.DataFrame({
             "original_row_index": data.iloc[split_index][ORIGINAL_ROW_COLUMN].to_numpy(),
             "source_file_id": data.iloc[split_index][SOURCE_FILE_COLUMN].to_numpy(),
             "source_row_number": data.iloc[split_index][SOURCE_ROW_COLUMN].to_numpy(),
             "split": split_name,
-            "true_residual": true,
-            "predicted_residual": pred,
+            "true_gim_vtec": true,
+            "predicted_gim_vtec": pred,
             "prediction_error": pred - true,
             "absolute_error": np.abs(pred - true),
+            "TEC_smooth_baseline": tec_smooth,
+            "baseline_error": tec_smooth - true,
+            "observed_residual": observed_residual,
+            "predicted_gim_minus_TEC_smooth": pred - tec_smooth,
         }))
     pd.concat(frames, ignore_index=True).to_csv(
         output_dir / "all_split_predictions.csv", index=False
@@ -837,7 +1005,7 @@ def _distribution_statistics(prefix: str, values: np.ndarray) -> dict[str, float
 
 def build_sigma_diagnostics(
     raw_indices: dict[str, np.ndarray], y_values: np.ndarray,
-    raw_predictions: dict[str, np.ndarray], residual_mean: float, residual_std: float,
+    raw_predictions: dict[str, np.ndarray], target_mean: float, target_std: float,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray]]:
     """生成 train/validation/test 在互斥 sigma 区间上的长表诊断。"""
     rows: list[dict[str, object]] = []
@@ -846,7 +1014,7 @@ def build_sigma_diagnostics(
     for split_name, split_index in raw_indices.items():
         true = y_values[split_index]
         predicted = raw_predictions[split_name]
-        z_score = (true - residual_mean) / residual_std
+        z_score = (true - target_mean) / target_std
         labels = sigma_segment_labels(z_score)
         labels_by_split[split_name] = labels
         z_scores_by_split[split_name] = z_score
@@ -931,8 +1099,8 @@ def save_sigma_diagnostic_figures(
             axis.plot(limits, limits, "r--", lw=1.2)
             axis.set_title(f"{segment} (n={int((labels == segment).sum()):,})")
             axis.grid(True, linestyle="--", alpha=0.3)
-        fig.supxlabel("True residual")
-        fig.supylabel("Predicted residual")
+        fig.supxlabel("True GIM VTEC")
+        fig.supylabel("Predicted GIM VTEC")
         fig.suptitle(f"{split_name}: true vs predicted by sigma segment")
         fig.tight_layout()
         fig.savefig(output_dir / f"{split_name}_sigma_segment_scatter.png", dpi=200)
@@ -947,7 +1115,7 @@ def save_sigma_diagnostic_figures(
         axis.axvline(-3, color="red", linestyle="--", lw=1)
         axis.axvline(3, color="red", linestyle="--", lw=1)
         axis.set_title(split_name)
-        axis.set_xlabel("Residual z-score (training statistics)")
+        axis.set_xlabel("GIM VTEC z-score (training statistics)")
         axis.grid(True, linestyle="--", alpha=0.3)
     axes[0].set_ylabel("Absolute prediction error")
     fig.tight_layout()
@@ -960,7 +1128,7 @@ def save_sigma_diagnostic_figures(
             y_values[raw_indices[split_name]], bins=80, density=True,
             histtype="step", linewidth=1.5, label=split_name,
         )
-    ax.set_xlabel("True residual")
+    ax.set_xlabel("True GIM VTEC")
     ax.set_ylabel("Density")
     ax.set_title("Target distribution by split")
     ax.grid(True, linestyle="--", alpha=0.3)
@@ -978,15 +1146,15 @@ def save_sigma_diagnostic_figures(
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.hist(
         test_true, bins=80, range=shared_range, density=True,
-        histtype="step", linewidth=1.6, label="true residual",
+        histtype="step", linewidth=1.6, label="true GIM VTEC",
     )
     ax.hist(
         test_predicted, bins=80, range=shared_range, density=True,
-        histtype="step", linewidth=1.6, label="predicted residual",
+        histtype="step", linewidth=1.6, label="predicted GIM VTEC",
     )
-    ax.set_xlabel("Residual")
+    ax.set_xlabel("GIM VTEC")
     ax.set_ylabel("Density")
-    ax.set_title("Full test: true and predicted residual distributions")
+    ax.set_title("Full test: true and predicted GIM VTEC distributions")
     ax.grid(True, linestyle="--", alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -1011,13 +1179,13 @@ def export_extreme_rows(
         frame.insert(1, "source_file", [str(files[value]) for value in source_ids])
         true = y_values[split_index][positions]
         predicted = raw_predictions[split_name][positions]
-        frame["true_residual"] = true
-        frame["predicted_residual"] = predicted
+        frame["true_gim_vtec"] = true
+        frame["predicted_gim_vtec"] = predicted
         frame["prediction_error"] = predicted - true
         frame["absolute_error"] = np.abs(predicted - true)
-        frame["residual_z_score"] = z_scores_by_split[split_name][positions]
+        frame["target_z_score"] = z_scores_by_split[split_name][positions]
         frame["sigma_segment"] = labels_by_split[split_name][positions]
-        frame["tail_direction"] = np.where(frame["residual_z_score"] > 3, "positive", "negative")
+        frame["tail_direction"] = np.where(frame["target_z_score"] > 3, "positive", "negative")
         output_name = f"{split_name}_extreme_beyond_3sigma.csv"
         frame.to_csv(output_dir / output_name, index=False)
         log(f"Exported {len(frame):,} extreme {split_name} rows to {output_name}")
@@ -1078,8 +1246,8 @@ def save_test_figure(
     fig.colorbar(density, ax=axes[0], label="log10(count)")
     bounds = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
     axes[0].plot(bounds, bounds, "r--", lw=1.5)
-    axes[0].set_xlabel("True residual")
-    axes[0].set_ylabel("Predicted residual")
+    axes[0].set_xlabel("True GIM VTEC")
+    axes[0].set_ylabel("Predicted GIM VTEC")
     axes[0].set_title(
         f"Test prediction (RMSE={metrics['rmse']:.5f}, R2={metrics['r2']:.4f})"
     )
@@ -1088,9 +1256,9 @@ def save_test_figure(
     )
     fig.colorbar(error_density, ax=axes[1], label="log10(count)")
     axes[1].axhline(0, color="red", linestyle="--")
-    axes[1].set_xlabel("True residual")
+    axes[1].set_xlabel("True GIM VTEC")
     axes[1].set_ylabel("Prediction error (predicted - true)")
-    axes[1].set_title("Error vs true residual")
+    axes[1].set_title("Error vs true GIM VTEC")
     axes[2].hist(errors, bins=50, color="#2ca02c", alpha=0.75)
     axes[2].axvline(0, color="red", linestyle="--")
     axes[2].set_xlabel("Prediction error (predicted - true)")
@@ -1146,13 +1314,132 @@ def save_eda_figures(data: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+def evaluate_existing_run(output_dir: Path) -> None:
+    """从新流程已有预测中重算 GIM 直接预测指标，不重新训练。"""
+    all_predictions_path = output_dir / "all_split_predictions.csv"
+    test_predictions_path = output_dir / "test_predictions.csv"
+    predictions_path = (
+        all_predictions_path
+        if all_predictions_path.is_file()
+        else test_predictions_path
+    )
+    manifest_path = output_dir / "input_file_manifest.csv"
+    if not predictions_path.is_file():
+        raise FileNotFoundError(
+            "Existing predictions not found; expected either "
+            f"{all_predictions_path} or {test_predictions_path}"
+        )
+    predictions_frame = pd.read_csv(predictions_path).reset_index(drop=True)
+    if "split" not in predictions_frame.columns:
+        if predictions_path == test_predictions_path:
+            predictions_frame["split"] = "test"
+        else:
+            raise ValueError(f"{predictions_path.name} is missing column: split")
+    required_prediction_columns = {
+        "source_file_id", "source_row_number", "split",
+        "true_gim_vtec", "predicted_gim_vtec",
+    }
+    missing = required_prediction_columns.difference(predictions_frame.columns)
+    if missing:
+        raise ValueError(
+            f"{predictions_path.name} is missing columns: {sorted(missing)}"
+        )
+
+    if "TEC_smooth_baseline" in predictions_frame.columns:
+        tec_smooth = predictions_frame["TEC_smooth_baseline"].to_numpy(
+            dtype=np.float64
+        )
+    else:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Input manifest not found: {manifest_path}")
+        manifest = pd.read_csv(manifest_path).set_index("source_file_id")
+        tec_smooth = np.full(len(predictions_frame), np.nan, dtype=np.float64)
+        for source_file_id, positions in predictions_frame.groupby(
+            "source_file_id", sort=False
+        ).groups.items():
+            source_id = int(source_file_id)
+            if source_id not in manifest.index:
+                raise KeyError(f"source_file_id {source_id} is absent from the manifest")
+            source_path = Path(str(manifest.loc[source_id, "path"]))
+            if not source_path.is_file():
+                raise FileNotFoundError(f"Source CSV no longer exists: {source_path}")
+            source = pd.read_csv(source_path, usecols=["TEC_smooth"])
+            position_array = np.asarray(positions, dtype=np.int64)
+            row_numbers = predictions_frame.loc[
+                position_array, "source_row_number"
+            ].to_numpy(dtype=np.int64)
+            if np.any(row_numbers < 0) or np.any(row_numbers >= len(source)):
+                raise IndexError(f"Source-row index is outside {source_path}")
+            tec_smooth[position_array] = source.iloc[row_numbers][
+                "TEC_smooth"
+            ].to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(tec_smooth)):
+            raise RuntimeError("Failed to recover finite TEC_smooth values for every prediction")
+
+    target_values = predictions_frame["true_gim_vtec"].to_numpy(dtype=np.float64)
+    data = pd.DataFrame({"TEC_smooth": tec_smooth, TARGET_COLUMN: target_values})
+    split_values = predictions_frame["split"].astype(str).to_numpy()
+    split_indices = {
+        name: np.flatnonzero(split_values == name)
+        for name in ("train", "validation", "test")
+        if np.any(split_values == name)
+    }
+    if "test" not in split_indices:
+        raise ValueError("Existing predictions must contain a test split")
+    target_predictions = {
+        name: predictions_frame.iloc[index]["predicted_gim_vtec"].to_numpy(
+            dtype=np.float64
+        )
+        for name, index in split_indices.items()
+    }
+    metrics_frame, summary = evaluate_gim_prediction(
+        data, split_indices, target_values, target_predictions
+    )
+    save_gim_prediction_outputs(metrics_frame, summary, output_dir)
+
+    predictions_frame["TEC_smooth_baseline"] = tec_smooth
+    predictions_frame["baseline_error"] = tec_smooth - target_values
+    predictions_frame["predicted_gim_minus_TEC_smooth"] = (
+        predictions_frame["predicted_gim_vtec"].to_numpy(dtype=np.float64)
+        - tec_smooth
+    )
+    augmented_name = (
+        "all_split_predictions_recalculated.csv"
+        if predictions_path == all_predictions_path
+        else "test_predictions_recalculated.csv"
+    )
+    predictions_frame.to_csv(output_dir / augmented_name, index=False)
+    predictions_frame.loc[predictions_frame["split"] == "test"].to_csv(
+        output_dir / "test_gim_predictions_recalculated.csv", index=False
+    )
+
+    metrics_path = output_dir / "metrics.json"
+    if metrics_path.is_file():
+        with metrics_path.open("r", encoding="utf-8") as handle:
+            run_metrics = json.load(handle)
+        run_metrics["gim_prediction_evaluation"] = summary
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(run_metrics, handle, ensure_ascii=False, indent=2)
+    log(f"Evaluation-only outputs written to {output_dir.resolve()}")
+
+
 def main() -> int:
     """主函数：完整执行数据处理、模型优化、训练、评估和结果保存的整个流程。"""
     args = parse_args()
     validate_args(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.evaluation_only:
+        if not args.output_dir.is_dir():
+            raise FileNotFoundError(
+                f"Existing result directory not found: {args.output_dir}"
+            )
+    else:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     log("Command line: " + shlex.join(sys.argv))
+    if args.evaluation_only:
+        evaluate_existing_run(args.output_dir)
+        return 0
 
+    assert args.input_dir is not None
     files = find_csv_files(args.input_dir, args.pattern, args.recursive)
     log(f"Found {len(files):,} CSV files")
     pd.DataFrame([
@@ -1179,7 +1466,8 @@ def main() -> int:
         save_eda_figures(data, args.output_dir)
 
     forbidden_features = {
-        TARGET_COLUMN, "is_3sigma", "is_iqr_outlier", "tail_segment", "sample_weight"
+        TARGET_COLUMN, FILTER_COLUMN, "is_3sigma", "is_iqr_outlier",
+        "tail_segment", "sample_weight",
     }
     leaked_features = sorted(forbidden_features.intersection(feature_columns))
     if leaked_features:
@@ -1196,8 +1484,8 @@ def main() -> int:
     )
     x_values = data_sorted[feature_columns].to_numpy(dtype=np.float32)
     y_values = data_sorted[TARGET_COLUMN].to_numpy(dtype=np.float32)
-    if np.any(y_values < 0):
-        raise RuntimeError("Hard QC failed: residual < 0 remains after cleaning")
+    if np.any(data_sorted[FILTER_COLUMN].to_numpy(dtype=np.float64) <= 0):
+        raise RuntimeError("Hard QC failed: residual <= 0 remains after cleaning")
     split_summary_rows = []
     for split_name, split_index in indices.items():
         split_frame = data_sorted.iloc[split_index]
@@ -1212,7 +1500,7 @@ def main() -> int:
             "longitude_min": float(split_frame["lon"].min()),
             "longitude_max": float(split_frame["lon"].max()),
         }
-        row.update(_distribution_statistics("residual", y_values[split_index]))
+        row.update(_distribution_statistics(TARGET_COLUMN, y_values[split_index]))
         split_summary_rows.append(row)
     pd.DataFrame(split_summary_rows).to_csv(
         args.output_dir / "split_summary.csv", index=False
@@ -1240,7 +1528,7 @@ def main() -> int:
         args.early_stopping_rounds, None,
     )
     history = save_training_history(model, args.output_dir)
-    model.save_model(args.output_dir / "xg_jason_ion_model.json")
+    model.save_model(args.output_dir / "xg_jason_gim_vtec_model.json")
     save_feature_importance(model, feature_columns, args.output_dir)
 
     evaluations: dict[str, dict[str, float]] = {}
@@ -1263,6 +1551,12 @@ def main() -> int:
         name: model.predict(x_values[split_index])
         for name, split_index in indices.items()
     }
+    gim_metrics_frame, gim_prediction_summary = evaluate_gim_prediction(
+        data_sorted, indices, y_values, predictions
+    )
+    save_gim_prediction_outputs(
+        gim_metrics_frame, gim_prediction_summary, args.output_dir
+    )
     save_prediction_files(
         data_sorted, indices, y_values, predictions, args.output_dir,
     )
@@ -1272,10 +1566,20 @@ def main() -> int:
         "original_row_index": original_indices[test_index],
         "source_file_id": data_sorted.iloc[test_index][SOURCE_FILE_COLUMN].to_numpy(),
         "source_row_number": data_sorted.iloc[test_index][SOURCE_ROW_COLUMN].to_numpy(),
-        "true_residual": y_values[test_index],
-        "predicted_residual": predictions["test"],
+        "true_gim_vtec": y_values[test_index],
+        "predicted_gim_vtec": predictions["test"],
         "prediction_error": predictions["test"] - y_values[test_index],
         "absolute_error": np.abs(predictions["test"] - y_values[test_index]),
+        "TEC_smooth_baseline": data_sorted.iloc[test_index]["TEC_smooth"].to_numpy(),
+        "baseline_error": (
+            data_sorted.iloc[test_index]["TEC_smooth"].to_numpy()
+            - y_values[test_index]
+        ),
+        "observed_residual": data_sorted.iloc[test_index][FILTER_COLUMN].to_numpy(),
+        "predicted_gim_minus_TEC_smooth": (
+            predictions["test"]
+            - data_sorted.iloc[test_index]["TEC_smooth"].to_numpy()
+        ),
     })
     test_predictions_frame.to_csv(
         args.output_dir / "test_predictions.csv", index=False
@@ -1336,12 +1640,14 @@ def main() -> int:
         "model_seed": args.model_seed,
         "sample_seed": args.sample_seed,
         "split_seed": args.split_seed,
-        "target_qc": "residual < 0 removed before sampling and splitting",
+        "target_column": TARGET_COLUMN,
+        "row_filter": "residual > 0 retained before sampling and splitting",
         "regularization": {
             "l1_reg_alpha": args.reg_alpha,
             "l2_reg_lambda": args.reg_lambda,
         },
         "maximum_boosting_rounds": args.n_estimators,
+        "gim_prediction_evaluation": gim_prediction_summary,
         "time_features": {
             "source_datetime_timezone": "UTC",
             "local_solar_hour_formula": "(UTC fractional hour + longitude / 15) modulo 24",
