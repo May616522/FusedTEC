@@ -1,0 +1,139 @@
+#!/bin/bash
+#SBATCH --job-name=xg_cosmic_residual
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
+#SBATCH --time=12:00:00
+#SBATCH --chdir=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021
+#SBATCH --output=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021/xg_cosmic_residual_%j.out
+#SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021/xg_cosmic_residual_%j.err
+
+# COSMIC residual 的 XGBoost Slurm 作业脚本。
+# 按完整年积日随机划分 70%/20%/10%，同一 DOY 不会进入多个集合。
+# 默认使用全部有效行，最多训练 500 轮并使用验证集早停，同时启用 L1/L2、
+# 行采样和列采样。训练集 residual 最低和最高各 10% 的样本使用更高权重。
+
+set -euo pipefail
+
+# 程序与数据位于不同目录，分别使用明确的绝对路径。
+SCRIPT_DIR="/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021"
+PYTHON_SCRIPT="${SCRIPT_DIR}/xg_cosmic_residual.py"
+
+# 如环境不同，仍可在提交作业时用同名环境变量覆盖下面三个路径。
+PYTHON_BIN="${PYTHON_BIN:-/share/home/u23114/tj23114/miniconda3/envs/LiuQingyuan/bin/python}"
+INPUT_DIR="${INPUT_DIR:-/share/home/u23114/tj23114/data/Yaoyaping_data/cosmic2021}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/xg_cosmic_results}"
+
+EXPERIMENT_NAME="random_complete_doy_7_2_1_regularized_500rounds_tailweighted"
+RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_NAME}/${RUN_ID}"
+
+N_ESTIMATORS="500"
+EARLY_STOPPING_ROUNDS="30"
+TAIL_QUANTILE="0.10"
+TAIL_WEIGHT="2.0"
+LEARNING_RATE="0.05"
+MAX_DEPTH="6"
+MIN_CHILD_WEIGHT="5"
+SUBSAMPLE="0.80"
+COLSAMPLE_BYTREE="0.80"
+REG_ALPHA="0.10"
+REG_LAMBDA="1.0"
+SPLIT_SEED="42"
+MODEL_SEED="42"
+SAMPLING_SEED="42"
+
+# 0 表示每个年积日保留全部有效行。试跑时可设为例如 5000；即使抽样，
+# 也是在每个 DOY 内独立随机抽取，之后仍以完整 DOY 为单位划分集合。
+MAX_ROWS_PER_DAY="0"
+
+if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
+    echo "ERROR: Python script not found: ${PYTHON_SCRIPT}" >&2
+    exit 2
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "ERROR: Python executable is unavailable: ${PYTHON_BIN}" >&2
+    exit 2
+fi
+if [[ ! -d "${INPUT_DIR}" ]]; then
+    echo "ERROR: input directory does not exist: ${INPUT_DIR}" >&2
+    exit 2
+fi
+if [[ ! -f "${INPUT_DIR}/cosmic2_model_2021_001.csv" ]]; then
+    echo "ERROR: first daily CSV is missing: ${INPUT_DIR}/cosmic2_model_2021_001.csv" >&2
+    exit 2
+fi
+if [[ ! -f "${INPUT_DIR}/cosmic2_model_2021_365.csv" ]]; then
+    echo "ERROR: last daily CSV is missing: ${INPUT_DIR}/cosmic2_model_2021_365.csv" >&2
+    exit 2
+fi
+
+shopt -s nullglob
+CSV_FILES=("${INPUT_DIR}"/cosmic2_model_2021_???.csv)
+if [[ "${#CSV_FILES[@]}" -ne 365 ]]; then
+    echo "ERROR: expected 365 daily CSV files, found ${#CSV_FILES[@]} in ${INPUT_DIR}" >&2
+    exit 2
+fi
+shopt -u nullglob
+
+mkdir -p "${OUTPUT_DIR}"
+
+if ! "${PYTHON_BIN}" -c "import matplotlib,numpy,pandas,sklearn,xgboost"; then
+    echo "ERROR: missing Python packages: numpy pandas matplotlib scikit-learn xgboost" >&2
+    exit 3
+fi
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+
+echo "Job ID: ${SLURM_JOB_ID:-local}"
+echo "Python script: ${PYTHON_SCRIPT}"
+echo "Python executable: ${PYTHON_BIN}"
+echo "Input: ${INPUT_DIR}"
+echo "Output: ${OUTPUT_DIR}"
+echo "Daily CSV files: ${#CSV_FILES[@]}"
+echo "Split: complete DOY random 70%/20%/10%, seed=${SPLIT_SEED}"
+echo "Target: residual (excluded from model features to prevent leakage)"
+echo "Boosting: max ${N_ESTIMATORS}, early stopping ${EARLY_STOPPING_ROUNDS}"
+echo "Tail weighting: lower/upper ${TAIL_QUANTILE} quantiles, weight=${TAIL_WEIGHT}"
+echo "Regularization: L1=${REG_ALPHA}, L2=${REG_LAMBDA}"
+echo "Sampling: max rows per DOY=${MAX_ROWS_PER_DAY}; 0 means all rows"
+
+COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}"
+    --input-dir "${INPUT_DIR}"
+    --output-dir "${OUTPUT_DIR}"
+    --year 2021
+    --train-ratio 0.70
+    --validation-ratio 0.20
+    --test-ratio 0.10
+    --split-seed "${SPLIT_SEED}"
+    --model-seed "${MODEL_SEED}"
+    --sampling-seed "${SAMPLING_SEED}"
+    --max-rows-per-day "${MAX_ROWS_PER_DAY}"
+    --n-estimators "${N_ESTIMATORS}"
+    --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}"
+    --tail-quantile "${TAIL_QUANTILE}"
+    --tail-weight "${TAIL_WEIGHT}"
+    --learning-rate "${LEARNING_RATE}"
+    --max-depth "${MAX_DEPTH}"
+    --min-child-weight "${MIN_CHILD_WEIGHT}"
+    --subsample "${SUBSAMPLE}"
+    --colsample-bytree "${COLSAMPLE_BYTREE}"
+    --reg-alpha "${REG_ALPHA}"
+    --reg-lambda "${REG_LAMBDA}"
+    --n-jobs "${SLURM_CPUS_PER_TASK:-1}"
+    --device cpu)
+
+printf 'Command:'
+printf ' %q' "${COMMAND[@]}"
+printf '\n'
+
+if command -v srun >/dev/null 2>&1 && [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    srun "${COMMAND[@]}"
+else
+    "${COMMAND[@]}"
+fi
+
+echo "Training completed successfully."
