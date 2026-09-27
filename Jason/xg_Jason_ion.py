@@ -2,12 +2,22 @@
 """Tune, train and audit a direct GIM VTEC XGBoost model.
 
 The default workflow keeps statistically rare targets and randomly assigns
+<<<<<<< HEAD
 complete calendar days to train/validation/test. A calendar day is an
 indivisible group: all rows from that day must stay in exactly one split.
 The target is ``gim_vtec``. ``TEC_smooth`` is an input feature together with
 the existing spatial, temporal and space-weather predictors. Both ``gim_vtec``
 and the algebraically related ``residual`` are forbidden as model features.
 Only rows satisfying the documented hard-QC rule ``residual > 0`` are retained
+=======
+complete calendar days within every calendar month to train/validation/test.
+A calendar day is an indivisible group: all rows from that day must stay in
+exactly one split, and every sufficiently populated month contributes to all
+three model splits.
+Every target threshold is fitted on the training split only, and validation/test
+are evaluated at their natural frequency.
+Rows whose residual is negative are removed by the documented hard-QC rule
+>>>>>>> fd392b4 (save local changes before rebase)
 before sampling and splitting.
 """
 
@@ -33,6 +43,7 @@ import pandas as pd
 import xgboost as xgb
 from optuna.samplers import TPESampler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import RobustScaler
 
 
 TARGET_COLUMN = "gim_vtec"
@@ -42,9 +53,43 @@ SOURCE_ROW_COLUMN = "__source_row_number"
 ORIGINAL_ROW_COLUMN = "__cleaned_row_index"
 LOCAL_TIME_SIN_COLUMN = "local_time_s"
 LOCAL_TIME_COS_COLUMN = "local_time_c"
+SOLAR_AZIMUTH_COLUMNS = ("solar_azimuth_s", "solar_azimuth_c")
+SOLAR_ALTITUDE_COLUMNS = ("solar_altitude_s", "solar_altitude_c")
+SOLAR_NOON_ALTITUDE_COLUMNS = (
+    "solar_noon_altitude_s", "solar_noon_altitude_c",
+)
+POST_SUNSET_COLUMN = "post_sunset_hours"
+POLAR_DAY_NIGHT_COLUMN = "polar_day_night"
+GEOMAGNETIC_LATITUDE_CYCLIC_COLUMNS = ("mag_lat_s", "mag_lat_c")
+LATITUDE_NORMALIZED_COLUMNS = {
+    "lat": "lat_norm",
+    "mag_lat": "mag_lat_norm",
+}
+LONGITUDE_CYCLIC_COLUMNS = {
+    "lon": ("lon_s", "lon_c"),
+    "mag_lon": ("mag_lon_s", "mag_lon_c"),
+}
+ROBUST_SCALED_OUTPUT_NAMES = {
+    "gim_vtec": "gim_vtec_scaled",
+    "f10.7_Index": "f10.7_scaled",
+    "Dst_Index": "Dst_scaled",
+    "Kp_Index": "Kp_scaled",
+    POST_SUNSET_COLUMN: "post_sunset_hours_scaled",
+}
+ALREADY_NORMALIZED_COLUMNS = {
+    "DOY_s", "DOY_c", LOCAL_TIME_SIN_COLUMN, LOCAL_TIME_COS_COLUMN,
+    *SOLAR_AZIMUTH_COLUMNS,
+    *SOLAR_ALTITUDE_COLUMNS,
+    *SOLAR_NOON_ALTITUDE_COLUMNS,
+    POLAR_DAY_NIGHT_COLUMN,
+    *GEOMAGNETIC_LATITUDE_CYCLIC_COLUMNS,
+    *LATITUDE_NORMALIZED_COLUMNS.values(),
+    *(name for pair in LONGITUDE_CYCLIC_COLUMNS.values() for name in pair),
+}
 EXCLUDED_COLUMNS = {
     "datetime", TARGET_COLUMN, FILTER_COLUMN, "TEC_raw", SOURCE_FILE_COLUMN,
     SOURCE_ROW_COLUMN, ORIGINAL_ROW_COLUMN, "HOD_s", "HOD_c",
+    "lat", "lon", "alt", "mag_lat", "mag_lon",
 }
 # Compatibility constants for the retained diagnostic helper functions. The
 # simplified main workflow below does not invoke sigma/tail segmentation or
@@ -114,18 +159,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split-seed", type=int, default=42,
-        help="Random seed used only by --split-strategy random-day.",
+        help="Random seed used by randomized calendar-day split strategies.",
     )
     parser.add_argument(
-        "--split-strategy", choices=("random-day", "time"), default="random-day",
+        "--split-strategy",
+        choices=("monthly-random-day", "random-day", "time"),
+        default="monthly-random-day",
         help=(
-            "Randomly assign indivisible calendar days (default), or use "
-            "chronological whole-day blocks for an optional extrapolation test."
+            "Randomly assign indivisible days inside every calendar month "
+            "(default), randomly assign days over the full period, or use "
+            "chronological whole-day blocks for an extrapolation test."
         ),
     )
     parser.add_argument("--train-ratio", type=float, default=0.70)
-    parser.add_argument("--validation-ratio", type=float, default=0.15)
-    parser.add_argument("--test-ratio", type=float, default=0.15)
+    parser.add_argument("--validation-ratio", type=float, default=0.20)
+    parser.add_argument("--test-ratio", type=float, default=0.10)
     parser.add_argument(
         "--fixed-altitude", type=float, default=None,
         help="Replace alt by this constant; default is the cleaned-data median.",
@@ -267,15 +315,91 @@ def sample_rows_within_days(
     return sampled, summary, daily_sampling
 
 
+def add_paper_solar_geometric_features(
+    data: pd.DataFrame, local_solar_hour: np.ndarray,
+) -> None:
+    """Add the solar-geometric CEIMv1 features described by Wang et al. (2026)."""
+    latitude_degrees = data["lat"].to_numpy(dtype=float)
+    latitude = np.deg2rad(latitude_degrees)
+    day_of_year = data["datetime"].dt.dayofyear.to_numpy(dtype=float)
+
+    # Equations (1) and (2) in Wang et al. (2026). Angles in the paper are
+    # expressed in degrees; trigonometric functions below use radians.
+    declination_degrees = 23.45 * np.sin(
+        np.deg2rad(360.0 * (284.0 + day_of_year) / 365.0)
+    )
+    declination = np.deg2rad(declination_degrees)
+    hour_angle = np.deg2rad(15.0 * (local_solar_hour - 12.0))
+
+    sin_altitude = (
+        np.sin(declination) * np.sin(latitude)
+        + np.cos(declination) * np.cos(latitude) * np.cos(hour_angle)
+    )
+    altitude = np.arcsin(np.clip(sin_altitude, -1.0, 1.0))
+
+    # atan2 supplies the azimuth quadrant that cannot be recovered from the
+    # paper's cosine equation alone. The result is clockwise from geographic
+    # north and wrapped to [0, 2*pi).
+    azimuth = np.mod(
+        np.arctan2(
+            np.sin(hour_angle),
+            np.cos(hour_angle) * np.sin(latitude)
+            - np.tan(declination) * np.cos(latitude),
+        )
+        + np.pi,
+        2.0 * np.pi,
+    )
+
+    noon_sin_altitude = (
+        np.sin(declination) * np.sin(latitude)
+        + np.cos(declination) * np.cos(latitude)
+    )
+    noon_altitude = np.arcsin(np.clip(noon_sin_altitude, -1.0, 1.0))
+
+    data[SOLAR_AZIMUTH_COLUMNS[0]] = np.sin(azimuth)
+    data[SOLAR_AZIMUTH_COLUMNS[1]] = np.cos(azimuth)
+    data[SOLAR_ALTITUDE_COLUMNS[0]] = np.sin(altitude)
+    data[SOLAR_ALTITUDE_COLUMNS[1]] = np.cos(altitude)
+    data[SOLAR_NOON_ALTITUDE_COLUMNS[0]] = np.sin(noon_altitude)
+    data[SOLAR_NOON_ALTITUDE_COLUMNS[1]] = np.cos(noon_altitude)
+
+    sunset_argument = -np.tan(latitude) * np.tan(declination)
+    polar_day = sunset_argument < -1.0
+    polar_night = sunset_argument > 1.0
+    transition = ~(polar_day | polar_night)
+    polar_day_night = np.zeros(len(data), dtype=np.int8)
+    polar_day_night[polar_day] = 1
+    polar_day_night[polar_night] = -1
+    data[POLAR_DAY_NIGHT_COLUMN] = polar_day_night
+
+    sunset_hour_angle = np.arccos(np.clip(sunset_argument, -1.0, 1.0))
+    sunset_local_hour = 12.0 + np.rad2deg(sunset_hour_angle) / 15.0
+    hours_since_sunset = np.zeros(len(data), dtype=float)
+    transition_night = transition & (sin_altitude < 0.0)
+    hours_since_sunset[transition_night] = np.mod(
+        local_solar_hour[transition_night] - sunset_local_hour[transition_night],
+        24.0,
+    )
+    # During polar night no daily sunset exists. Twenty-four hours encodes
+    # continuous darkness, while PND=-1 preserves the distinct regime.
+    hours_since_sunset[polar_night] = 24.0
+    data[POST_SUNSET_COLUMN] = hours_since_sunset
+
+
 def clean_and_validate(
     data: pd.DataFrame, requested_altitude: float | None
 ) -> tuple[
     pd.DataFrame, list[str], float, dict[str, float], dict[str, object], pd.DataFrame
 ]:
+<<<<<<< HEAD
     """清理缺失/无穷值，仅保留 residual > 0，并固定高度值。"""
     required = {
         TARGET_COLUMN, FILTER_COLUMN, "TEC_smooth", "datetime", "lat", "lon", "alt"
     }
+=======
+    """清理数据，固定高度，并构造不依赖样本统计量的归一化特征。"""
+    required = {TARGET_COLUMN, "datetime", "lat", "lon", "alt", "gim_vtec"}
+>>>>>>> fd392b4 (save local changes before rebase)
     missing = sorted(required.difference(data.columns))
     if missing:
         raise ValueError(f"Required columns are missing: {missing}")
@@ -352,6 +476,30 @@ def clean_and_validate(
     phase = 2.0 * np.pi * local_solar_hour / 24.0
     data[LOCAL_TIME_SIN_COLUMN] = np.sin(phase)
     data[LOCAL_TIME_COS_COLUMN] = np.cos(phase)
+    add_paper_solar_geometric_features(data, local_solar_hour)
+
+    # Latitude has a fixed physical range and therefore does not need fitted
+    # statistics. Longitude is circular: modulo 360 makes equivalent boundary
+    # values such as -180 and 180 follow the exact same numerical path before
+    # sine/cosine encoding.
+    for source, output in LATITUDE_NORMALIZED_COLUMNS.items():
+        if source not in data.columns:
+            continue
+        values = data[source].to_numpy(dtype=float)
+        if np.any((values < -90.0) | (values > 90.0)):
+            raise ValueError(f"{source} must be within [-90, 90] degrees")
+        data[output] = values / 90.0
+    for source, (sine_output, cosine_output) in LONGITUDE_CYCLIC_COLUMNS.items():
+        if source not in data.columns:
+            continue
+        radians = np.deg2rad(np.mod(data[source].to_numpy(dtype=float), 360.0))
+        data[sine_output] = np.sin(radians)
+        data[cosine_output] = np.cos(radians)
+    if "mag_lat" in data.columns:
+        magnetic_latitude = np.deg2rad(data["mag_lat"].to_numpy(dtype=float))
+        data[GEOMAGNETIC_LATITUDE_CYCLIC_COLUMNS[0]] = np.sin(magnetic_latitude)
+        data[GEOMAGNETIC_LATITUDE_CYCLIC_COLUMNS[1]] = np.cos(magnetic_latitude)
+
     feature_columns = [column for column in data.columns if column not in EXCLUDED_COLUMNS]
     if not feature_columns:
         raise ValueError("No feature columns remain after exclusions")
@@ -375,9 +523,127 @@ def clean_and_validate(
         "Replaced UTC HOD_s/HOD_c with local solar-time features "
         f"{LOCAL_TIME_SIN_COLUMN}/{LOCAL_TIME_COS_COLUMN} computed from UTC datetime and longitude"
     )
+    log(
+        "Coordinate preprocessing: latitude divided by 90; geographic and "
+        "magnetic longitude replaced by sine/cosine; fixed altitude excluded"
+    )
+    log(
+        "Added Wang et al. (2026) solar-geometric features: solar azimuth, "
+        "solar altitude, noon altitude, post-sunset duration, PND, and "
+        "magnetic latitude sine/cosine"
+    )
     return (
         data, feature_columns, fixed_altitude, original_altitude,
         qc_log, removed_records,
+    )
+
+
+def normalize_model_features(
+    data: pd.DataFrame, source_feature_columns: list[str], train_index: np.ndarray,
+    output_dir: Path,
+) -> tuple[np.ndarray, list[str], dict[str, object]]:
+    """仅用训练集统计量稳健缩放连续特征，并保存完整预处理参数。"""
+    robust_columns = [
+        column for column in source_feature_columns
+        if column not in ALREADY_NORMALIZED_COLUMNS
+    ]
+    passthrough_columns = [
+        column for column in source_feature_columns
+        if column in ALREADY_NORMALIZED_COLUMNS
+    ]
+    output_names = {
+        column: ROBUST_SCALED_OUTPUT_NAMES.get(column, f"{column}_scaled")
+        for column in robust_columns
+    }
+    normalized_feature_columns = [
+        output_names.get(column, column) for column in source_feature_columns
+    ]
+    if len(set(normalized_feature_columns)) != len(normalized_feature_columns):
+        raise ValueError(
+            "Feature normalization produced duplicate output names: "
+            f"{normalized_feature_columns}"
+        )
+
+    feature_frame = pd.DataFrame(index=data.index)
+    scaler_parameters: dict[str, dict[str, float]] = {}
+    if robust_columns:
+        scaler = RobustScaler(quantile_range=(25.0, 75.0))
+        scaler.fit(data.iloc[train_index][robust_columns])
+        scaled_values = scaler.transform(data[robust_columns])
+        for position, source in enumerate(robust_columns):
+            output = output_names[source]
+            feature_frame[output] = scaled_values[:, position]
+            scaler_parameters[source] = {
+                "output_column": output,
+                "training_median": float(scaler.center_[position]),
+                "training_iqr_scale": float(scaler.scale_[position]),
+            }
+
+    for source in passthrough_columns:
+        feature_frame[source] = data[source].to_numpy(dtype=float)
+    feature_frame = feature_frame[normalized_feature_columns]
+    if not np.isfinite(feature_frame.to_numpy(dtype=float)).all():
+        raise RuntimeError("Non-finite values were produced during feature normalization")
+
+    preprocessing: dict[str, object] = {
+        "fit_split": "train",
+        "fit_row_count": int(len(train_index)),
+        "feature_columns": normalized_feature_columns,
+        "transformations": {
+            "latitude": {
+                "method": "divide_by_90",
+                "columns": LATITUDE_NORMALIZED_COLUMNS,
+            },
+            "longitude": {
+                "method": "sin_cos_degrees_after_modulo_360",
+                "columns": {
+                    source: list(outputs)
+                    for source, outputs in LONGITUDE_CYCLIC_COLUMNS.items()
+                    if source in data.columns
+                },
+            },
+            "paper_solar_geometry": {
+                "reference": "Wang et al. (2026), doi:10.1109/JSTARS.2026.3660927",
+                "declination_degrees": "23.45 * sin(360 * (284 + DOY) / 365)",
+                "hour_angle_degrees": "15 * (local_solar_hour - 12)",
+                "solar_azimuth_columns": list(SOLAR_AZIMUTH_COLUMNS),
+                "solar_altitude_columns": list(SOLAR_ALTITUDE_COLUMNS),
+                "solar_noon_altitude_columns": list(SOLAR_NOON_ALTITUDE_COLUMNS),
+                "post_sunset_source_column": POST_SUNSET_COLUMN,
+                "post_sunset_definition": (
+                    "hours since the most recent sunset during ordinary night; "
+                    "0 during daylight/polar day; 24 during polar night"
+                ),
+                "polar_day_night_column": POLAR_DAY_NIGHT_COLUMN,
+                "polar_day_night_encoding": {
+                    "polar_night": -1, "transition": 0, "polar_day": 1,
+                },
+                "geomagnetic_longitude_columns": list(
+                    LONGITUDE_CYCLIC_COLUMNS["mag_lon"]
+                ),
+                "geomagnetic_latitude_columns": list(
+                    GEOMAGNETIC_LATITUDE_CYCLIC_COLUMNS
+                ),
+            },
+            "robust_scaling": {
+                "method": "(x - training_median) / training_IQR",
+                "quantile_range": [25.0, 75.0],
+                "parameters": scaler_parameters,
+            },
+            "unchanged_bounded_columns": passthrough_columns,
+            "excluded_constant_columns": ["alt"],
+        },
+    }
+    with (output_dir / "preprocessing.json").open("w", encoding="utf-8") as handle:
+        json.dump(preprocessing, handle, ensure_ascii=False, indent=2)
+    log(
+        f"Normalized model features using training rows only: "
+        f"{len(robust_columns)} robust-scaled, {len(passthrough_columns)} already bounded"
+    )
+    return (
+        feature_frame.to_numpy(dtype=np.float32),
+        normalized_feature_columns,
+        preprocessing,
     )
 
 
@@ -462,12 +728,42 @@ def build_sigma_filtered_splits(
     return filtered_splits, test_clean_index, sigma_filter
 
 
+def allocate_day_counts(
+    day_count: int, train_ratio: float, validation_ratio: float, test_ratio: float,
+) -> dict[str, int]:
+    """按最大余数法分配某个月的日期，确保三个集合均至少包含一天。"""
+    if day_count < 3:
+        raise ValueError(
+            f"A monthly split needs at least 3 valid calendar days; got {day_count}"
+        )
+    names = ("train", "validation", "test")
+    ratios = np.array([train_ratio, validation_ratio, test_ratio], dtype=float)
+    exact = ratios * day_count
+    counts = np.floor(exact).astype(int)
+    remaining = day_count - int(counts.sum())
+    fractions = np.round(exact - counts, 12)
+    # Stable ordering resolves equal remainders as train, validation, then test.
+    priority = sorted(range(3), key=lambda position: (-fractions[position], position))
+    for position in priority[:remaining]:
+        counts[position] += 1
+
+    for position in np.flatnonzero(counts == 0):
+        donor = int(np.argmax(counts))
+        if counts[donor] <= 1:
+            raise ValueError(f"Cannot create three non-empty splits from {day_count} days")
+        counts[donor] -= 1
+        counts[position] += 1
+    if int(counts.sum()) != day_count:
+        raise RuntimeError("Monthly day allocation does not sum to the month day count")
+    return {name: int(count) for name, count in zip(names, counts)}
+
+
 def split_by_calendar_day(
     data: pd.DataFrame, daily_sampling: pd.DataFrame, strategy: str, split_seed: int,
     train_ratio: float, validation_ratio: float, test_ratio: float,
     output_dir: Path,
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
-    """按完整自然日划分；默认随机分配日期，同一自然日绝不跨集合。"""
+    """按完整自然日划分；可在每个自然月内独立随机分配日期。"""
     date_frame = daily_sampling[[
         "calendar_date", "year", "day_of_year", "month",
         "rows_before_sampling", "rows_after_sampling", "realized_fraction",
@@ -476,26 +772,51 @@ def split_by_calendar_day(
         raise ValueError("Too few calendar days for a grouped train/validation/test split")
     date_frame = date_frame.sort_values("calendar_date").reset_index(drop=True)
     day_count = len(date_frame)
-    train_count = int(np.floor(day_count * train_ratio))
-    validation_count = int(np.floor(day_count * validation_ratio))
-    train_count = min(max(train_count, 1), day_count - 2)
-    validation_count = min(max(validation_count, 1), day_count - train_count - 1)
-    if strategy == "random-day":
-        order = np.random.default_rng(split_seed).permutation(day_count)
-        ordered = date_frame.iloc[order].reset_index(drop=True)
+    assignments: list[pd.DataFrame] = []
+    if strategy == "monthly-random-day":
+        rng = np.random.default_rng(split_seed)
+        for (year, month), month_days in date_frame.groupby(
+            ["year", "month"], sort=True
+        ):
+            month_days = month_days.reset_index(drop=True)
+            counts = allocate_day_counts(
+                len(month_days), train_ratio, validation_ratio, test_ratio
+            )
+            ordered = month_days.iloc[rng.permutation(len(month_days))].reset_index(drop=True)
+            start = 0
+            for split_name in ("train", "validation", "test"):
+                stop = start + counts[split_name]
+                part = ordered.iloc[start:stop].copy()
+                part["split"] = split_name
+                assignments.append(part)
+                start = stop
+            log(
+                f"Monthly day split {int(year):04d}-{int(month):02d}: "
+                f"train={counts['train']}, validation={counts['validation']}, "
+                f"test={counts['test']}"
+            )
     else:
-        ordered = date_frame
-    train_days = ordered.iloc[:train_count]
-    validation_days = ordered.iloc[train_count:train_count + validation_count]
-    test_days = ordered.iloc[train_count + validation_count:]
-
-    assignments = []
-    for split_name, split_days in (
-        ("train", train_days), ("validation", validation_days), ("test", test_days)
-    ):
-        part = split_days.copy()
-        part["split"] = split_name
-        assignments.append(part)
+        train_count = int(np.floor(day_count * train_ratio))
+        validation_count = int(np.floor(day_count * validation_ratio))
+        train_count = min(max(train_count, 1), day_count - 2)
+        validation_count = min(max(validation_count, 1), day_count - train_count - 1)
+        if strategy == "random-day":
+            order = np.random.default_rng(split_seed).permutation(day_count)
+            ordered = date_frame.iloc[order].reset_index(drop=True)
+        else:
+            ordered = date_frame
+        split_day_frames = (
+            ("train", ordered.iloc[:train_count]),
+            (
+                "validation",
+                ordered.iloc[train_count:train_count + validation_count],
+            ),
+            ("test", ordered.iloc[train_count + validation_count:]),
+        )
+        for split_name, split_days in split_day_frames:
+            part = split_days.copy()
+            part["split"] = split_name
+            assignments.append(part)
     day_assignments = (
         pd.concat(assignments, ignore_index=True)
         .sort_values("calendar_date")
@@ -530,6 +851,29 @@ def split_by_calendar_day(
     if row_assignments.groupby("calendar_date")["split"].nunique().max() != 1:
         raise RuntimeError("At least one calendar date was assigned to multiple splits")
     row_assignments.to_csv(output_dir / "split_assignments.csv", index=False)
+
+    monthly_days = (
+        day_assignments.groupby(["year", "month", "split"])
+        .size().unstack(fill_value=0)
+        .reindex(columns=["train", "validation", "test"], fill_value=0)
+    )
+    monthly_rows = (
+        day_assignments.groupby(["year", "month", "split"])["rows_after_sampling"]
+        .sum().unstack(fill_value=0)
+        .reindex(columns=["train", "validation", "test"], fill_value=0)
+    )
+    monthly_summary = monthly_days.add_suffix("_days").join(
+        monthly_rows.add_suffix("_rows")
+    ).reset_index()
+    monthly_summary["total_days"] = monthly_summary[
+        ["train_days", "validation_days", "test_days"]
+    ].sum(axis=1)
+    if strategy == "monthly-random-day" and (
+        monthly_summary[["train_days", "validation_days", "test_days"]].min(axis=1) < 1
+    ).any():
+        raise RuntimeError("At least one month is absent from a model split")
+    monthly_summary.to_csv(output_dir / "monthly_split_summary.csv", index=False)
+
     day_assignments["calendar_date"] = day_assignments["calendar_date"].dt.strftime("%Y-%m-%d")
     day_assignments.to_csv(output_dir / "day_assignments.csv", index=False)
     log(
@@ -1461,7 +1805,7 @@ def main() -> int:
     data, sampling_summary, daily_sampling = sample_rows_within_days(
         data, args.sample_fraction, args.sample_seed
     )
-    log(f"Model features ({len(feature_columns)}): {feature_columns}")
+    log(f"Source model features before fitted scaling ({len(feature_columns)}): {feature_columns}")
     if args.save_eda:
         save_eda_figures(data, args.output_dir)
 
@@ -1473,7 +1817,7 @@ def main() -> int:
     if leaked_features:
         raise RuntimeError(f"Target-derived columns cannot be model features: {leaked_features}")
 
-    # 先按时间排序以保证输出稳定，再随机分配不可拆分的完整自然日。
+    # 先按时间排序以保证输出稳定，再按配置随机分配不可拆分的完整自然日。
     data_sorted = data.sort_values("datetime").reset_index(drop=False)
     original_indices = data_sorted[ORIGINAL_ROW_COLUMN].to_numpy()
     data_sorted = data_sorted.reset_index(drop=True)
@@ -1482,7 +1826,10 @@ def main() -> int:
         args.train_ratio, args.validation_ratio, args.test_ratio,
         args.output_dir,
     )
-    x_values = data_sorted[feature_columns].to_numpy(dtype=np.float32)
+    x_values, feature_columns, preprocessing = normalize_model_features(
+        data_sorted, feature_columns, indices["train"], args.output_dir
+    )
+    log(f"Normalized model features ({len(feature_columns)}): {feature_columns}")
     y_values = data_sorted[TARGET_COLUMN].to_numpy(dtype=np.float32)
     if np.any(data_sorted[FILTER_COLUMN].to_numpy(dtype=np.float64) <= 0):
         raise RuntimeError("Hard QC failed: residual <= 0 remains after cleaning")
@@ -1608,11 +1955,15 @@ def main() -> int:
         },
         "split_rule": {
             "grouping_unit": "calendar date",
+            "stratification_unit": (
+                "calendar month" if args.split_strategy == "monthly-random-day" else None
+            ),
             "assignment_seed": args.split_seed,
             "strategy": args.split_strategy,
             "same_day_cross_split_allowed": False,
             "day_assignment_file": "day_assignments.csv",
             "row_assignment_file": "split_assignments.csv",
+            "monthly_summary_file": "monthly_split_summary.csv",
         },
         "model_split_rows": {
             "train": len(indices["train"]),
@@ -1654,6 +2005,7 @@ def main() -> int:
             "columns": [LOCAL_TIME_SIN_COLUMN, LOCAL_TIME_COS_COLUMN],
             "replaced_columns": ["HOD_s", "HOD_c"],
         },
+        "preprocessing": preprocessing,
         "feature_columns": feature_columns,
         "fixed_altitude": fixed_altitude,
         "original_altitude": original_altitude,

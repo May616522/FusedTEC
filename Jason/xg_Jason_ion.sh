@@ -9,6 +9,7 @@
 #SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/jason2021/xg_jason_ion_%j.err
 
 # Slurm job file for xg_Jason_ion.py.
+<<<<<<< HEAD
 # Trains an XGBoost model that directly predicts GIM VTEC from TEC_smooth and
 # the existing spatial, temporal, solar and geomagnetic features, using a reproducible
 # random complete-calendar-day split. All valid rows are retained before
@@ -18,6 +19,22 @@
 # are retained before sampling and splitting. The model uses at most 300 boosting
 # rounds with early stopping, plus explicit L1 and L2 regularization.
 # Local solar-time sine/cosine replace UTC HOD sine/cosine.
+=======
+# Trains an XGBoost model for Jason ionospheric residuals using a reproducible
+# month-stratified complete-calendar-day split. All valid rows are retained.
+# Inside every calendar month, complete days are randomly assigned at about
+# 70%/20%/10% to train/validation/test. A 30-day month therefore uses 21/6/3;
+# 31-, 29-, and 28-day months are adjusted while preserving this cycle. Every
+# row from one day stays in exactly one split. Rows with residual < 0 are
+# removed before sampling and splitting. The model uses at most 300 boosting
+# rounds with early stopping, plus explicit L1 and L2 regularization. Longitude
+# and magnetic longitude use circular sine/cosine encoding; latitude is divided
+# by 90; other continuous features use training-only robust scaling. Fixed
+# altitude is excluded from the model. Local solar-time sine/cosine replace UTC
+# HOD sine/cosine. Solar azimuth, solar altitude, solar-noon altitude,
+# post-sunset duration, polar day/night, and magnetic-coordinate trigonometric
+# features follow Wang et al. (2026), DOI 10.1109/JSTARS.2026.3660927.
+>>>>>>> fd392b4 (save local changes before rebase)
 # If your cluster requires them, also add its #SBATCH --partition and
 # #SBATCH --account lines above. Resource limits (CPU, memory, time) should be
 # adjusted to the rules of your cluster.
@@ -32,7 +49,11 @@ INPUT_DIR="/share/home/u23114/tj23114/data/Yaoyaping_data/jason2021"
 
 # Each Slurm job gets an independent directory so an earlier result cannot be
 # overwritten accidentally.
+<<<<<<< HEAD
 EXPERIMENT_NAME="direct_gim_vtec_from_tec_smooth_residual_positive_300rounds"
+=======
+EXPERIMENT_NAME="monthly_21_6_3_wang2026_features_regularized_300rounds"
+>>>>>>> fd392b4 (save local changes before rebase)
 RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${SCRIPT_DIR}/xg_Jason_ion_results/${EXPERIMENT_NAME}/${RUN_ID}"
 
@@ -66,8 +87,8 @@ SAMPLE_FRACTION="1.0"
 SAMPLE_SEED="42"
 SPLIT_SEED="42"
 TRAIN_RATIO="0.70"
-VALIDATION_RATIO="0.15"
-TEST_RATIO="0.15"
+VALIDATION_RATIO="0.20"
+TEST_RATIO="0.10"
 
 # Optional parameters (commented out by default):
 # --pattern: File pattern to match (default: "*.csv")
@@ -78,7 +99,8 @@ TEST_RATIO="0.15"
 # --save-eda: Generate exploratory data analysis plots (add flag to enable)
 # --sample-fraction: fraction retained inside every day; this run uses 1.0
 # --sample-seed: used only when sample-fraction is smaller than 1.0
-# --split-strategy random-day: randomly assign complete days (used below)
+# --split-strategy monthly-random-day: randomize complete days within each month
+# --split-strategy random-day: randomly assign complete days over the full period
 # --split-strategy time: optional chronological extrapolation comparison
 
 # Directly use the Python executable in LiuQingyuan's Conda environment. This
@@ -120,6 +142,7 @@ echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Host: $(hostname)"
 echo "Output: ${OUTPUT_DIR}"
 echo "CPU threads: ${SLURM_CPUS_PER_TASK:-1}"
+<<<<<<< HEAD
 if [[ "${EVALUATION_ONLY}" == "1" ]]; then
     echo "Mode: evaluation only (no retraining)"
     COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
@@ -161,6 +184,42 @@ else
         --model-seed "${MODEL_SEED}" \
         --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
 fi
+=======
+echo "Optuna: ${N_TRIALS} trials, timeout ${OPTUNA_TIMEOUT}s"
+echo "Experiment: ${EXPERIMENT_NAME}"
+echo "Within-day sampling fraction: ${SAMPLE_FRACTION}; all valid rows retained"
+echo "Monthly random whole-day split: train/validation/test = ${TRAIN_RATIO}/${VALIDATION_RATIO}/${TEST_RATIO} (seed=${SPLIT_SEED})"
+echo "Monthly cycle: 30-day month=21/6/3; other month lengths allocated proportionally"
+echo "Calendar-day constraint: every row from one day stays in exactly one split"
+echo "Target QC: residual < 0 removed before sampling and splitting"
+echo "Training: max ${N_ESTIMATORS} rounds, early stopping=${EARLY_STOPPING_ROUNDS}"
+echo "Regularization: L1 reg_alpha=${REG_ALPHA}; L2 reg_lambda=${REG_LAMBDA}"
+echo "Additional model feature: gim_vtec"
+echo "Time features: local solar-time sine/cosine computed from UTC datetime and longitude"
+echo "Preprocessing: longitude/magnetic longitude sine-cosine; latitude / 90"
+echo "Preprocessing: continuous features robust-scaled using training data only; fixed altitude excluded"
+echo "Paper features: Wang et al. (2026) solar geometry, post-sunset duration, PND, and magnetic latitude sine-cosine"
+
+COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" \
+    --input-dir "${INPUT_DIR}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --fixed-altitude "${FIXED_ALTITUDE}" \
+    --sample-fraction "${SAMPLE_FRACTION}" \
+    --sample-seed "${SAMPLE_SEED}" \
+    --split-strategy monthly-random-day \
+    --split-seed "${SPLIT_SEED}" \
+    --train-ratio "${TRAIN_RATIO}" \
+    --validation-ratio "${VALIDATION_RATIO}" \
+    --test-ratio "${TEST_RATIO}" \
+    --n-trials "${N_TRIALS}" \
+    --optuna-timeout "${OPTUNA_TIMEOUT}" \
+    --n-estimators "${N_ESTIMATORS}" \
+    --early-stopping-rounds "${EARLY_STOPPING_ROUNDS}" \
+    --reg-alpha "${REG_ALPHA}" \
+    --reg-lambda "${REG_LAMBDA}" \
+    --model-seed "${MODEL_SEED}" \
+    --n-jobs "${SLURM_CPUS_PER_TASK:-1}")
+>>>>>>> fd392b4 (save local changes before rebase)
 
 printf 'Command:'
 printf ' %q' "${COMMAND[@]}"

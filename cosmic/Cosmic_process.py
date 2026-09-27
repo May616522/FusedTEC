@@ -1,3 +1,11 @@
+"""读取 COSMIC-2 ionPrf 电子密度剖面并执行基础质量控制。
+
+脚本提供四项剖面质控：F2 层峰值高度范围、高空电子密度梯度、原始与平滑
+剖面的平均相对偏差，以及 300 km 以上的归一化均方差。既可处理单个 NetCDF
+剖面，也可批量检查 ``tar.gz`` 压缩包，并支持绘制原始/平滑电子密度剖面。
+作为模块使用时，``quality_control`` 是供其他 COSMIC 处理脚本调用的主入口。
+"""
+
 from dataclasses import dataclass
 import xarray as xr
 import numpy as np
@@ -9,16 +17,23 @@ import matplotlib.pyplot as plt
 
 @dataclass
 class CosmicConfig:
-    NM_F2_MIN = 2e10         # el/m^3
-    NM_F2_MAX = 2e12         # el/m^3
-    HM_F2_MIN = 200.0        # km
-    HM_F2_MAX = 450.0        # km
+    """集中保存各项电子密度剖面质量控制阈值。"""
+
+    NM_F2_MIN = 2e10         # F2 层峰值电子密度下限，单位 el/m^3（当前未启用）
+    NM_F2_MAX = 2e12         # F2 层峰值电子密度上限，单位 el/m^3（当前未启用）
+    HM_F2_MIN = 200.0        # F2 层峰值高度下限，单位 km
+    HM_F2_MAX = 450.0        # F2 层峰值高度上限，单位 km
     GRADIENT_MAX=-0.1e5
     MD_MAX=0.05
     MD_MIN=0
     DELTA_MAX=0.02
     
 def qc_nmf2_hmf2(file,cfg):
+    """检查 F2 层峰值高度是否落在配置范围内。
+
+    NmF2 已换算为 SI 单位，但相应阈值判断目前保留为停用状态。
+    """
+
     nm_f2_raw=file["nm_f2_raw"]
     hm_f2_raw=file["hm_f2_raw"]
     nm_f2_m3 = nm_f2_raw * 1e6
@@ -30,7 +45,9 @@ def qc_nmf2_hmf2(file,cfg):
 
 
 def qc_grad(file,cfg):
-    #这里面的高度是否需要排序
+    """检查约 420—490 km 高度段的平滑电子密度梯度。"""
+
+    # 通过最近高度点取值，因此无需依赖剖面数组的升降序。
     alt=file["alt"]
     ne_smooth=file["ne_smooth"]
     idx_490 = np.argmin(np.abs(alt - 490.0))
@@ -41,6 +58,8 @@ def qc_grad(file,cfg):
     return True,"pass"
 
 def qc_md(file,cfg):
+    """检查 180 km 以上原始剖面相对平滑剖面的平均偏差 MD。"""
+
     ne=file["ne"]
     ne_smooth=file["ne_smooth"]
     alt=file["alt"]
@@ -55,6 +74,8 @@ def qc_md(file,cfg):
     return True,"pass"
 
 def qc_delta(file,cfg):
+    """检查 300 km 以上相对 NmF2 归一化的剖面均方差。"""
+
 
     ne=file["ne"]
     ne_smooth=file["ne_smooth"]
@@ -73,8 +94,12 @@ def qc_delta(file,cfg):
     return True,"pass"
     
 
-#总的质量控制函数
 def quality_control(file,cfg):
+    """依次执行全部质控项，遇到首个失败项即返回原因。
+
+    返回 ``(是否通过, 状态代码)``；全部通过时状态代码为 ``pass``。
+    """
+
 
     tests=[
         qc_nmf2_hmf2,
@@ -97,14 +122,11 @@ def quality_control(file,cfg):
      
 
 def read_ro_profile(filepath):
-    """
-    读取GNSS RO电子密度剖面
-    return: dict   
-    """
+    """读取 GNSS 掩星 NetCDF，并返回质控所需的剖面和属性字典。"""
     with xr.open_dataset(filepath) as ds:
         alt = ds["MSL_alt"].values.flatten()
         ne = ds["ELEC_dens"].values.flatten()
-        #这里原本应该检查数据是否存在异常值吗？还是影响不大
+        # 使用 9 点均值滤波构造参考剖面；异常值影响由后续偏差指标反映。
         win_size = 9
         ne_smooth = uniform_filter1d(ne, size=win_size, mode="nearest")
         lat = ds["GEO_lat"].values.flatten()
@@ -125,6 +147,8 @@ def read_ro_profile(filepath):
         "hm_f2_raw": hm_f2_raw}
     
 def process_file(path):
+    """读取并质控单个剖面文件，返回文件路径、状态和通过标记。"""
+
     profile=read_ro_profile(path)
     cfg=CosmicConfig()
     ok,msg=quality_control(profile,cfg)
@@ -134,8 +158,9 @@ def process_file(path):
         "pass":ok
     }
     
-#对一个剖面进行可视化
 def plot_profile(file):
+    """绘制单条剖面的原始和平滑电子密度随高度变化曲线。"""
+
 
     alt=file["alt"]
     ne=file["ne"]
@@ -152,11 +177,13 @@ def plot_profile(file):
     plt.show()
 
 def batch_test(tar_path):
+    """批量质控压缩包内指定后缀的剖面，并返回通过的成员名称。"""
+
     files=[]
-    # 打开tar.gz
+    # 直接读取 tar.gz，避免将大量 NetCDF 文件解压到磁盘。
     with tarfile.open(tar_path, "r:gz") as tar:
         for member in tar.getmembers():
-            # 筛选nc文件
+            # 仅处理标准 ionPrf NetCDF 成员。
             if member.name.endswith(".0001_nc"):
                 files.append(member)
         total=len(files)
