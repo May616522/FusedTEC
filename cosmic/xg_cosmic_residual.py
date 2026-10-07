@@ -17,6 +17,7 @@ Kp 和 Dst 的滞后特征在运行时直接从逐小时 OMNI 文件生成，避
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import optuna
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -118,6 +120,19 @@ def parse_args() -> argparse.Namespace:
         help="在非测试 DOY 上进行的 GroupKFold 折数",
     )
     parser.add_argument(
+        "--optuna-trials",
+        type=int,
+        default=20,
+        help="Optuna 参数搜索次数；每次都执行完整 GroupKFold",
+    )
+    parser.add_argument(
+        "--optuna-timeout-minutes",
+        type=float,
+        default=0.0,
+        help="Optuna 最长搜索分钟数；0 表示仅由 trials 控制",
+    )
+    parser.add_argument("--optuna-seed", type=int, default=42)
+    parser.add_argument(
         "--max-rows-per-day",
         type=int,
         default=0,
@@ -169,6 +184,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("训练/验证/测试比例之和必须为 1")
     if args.cv_folds < 2:
         raise ValueError("cv-folds 必须大于或等于 2")
+    if args.optuna_trials < 1:
+        raise ValueError("optuna-trials 必须大于 0")
+    if args.optuna_timeout_minutes < 0.0:
+        raise ValueError("optuna-timeout-minutes 不能为负")
     if args.n_estimators < 1:
         raise ValueError("n-estimators 必须大于 0")
     if args.early_stopping_rounds < 0:
@@ -555,6 +574,127 @@ def fit_model(
     return model
 
 
+def suggest_model_parameters(
+    trial: optuna.Trial, base_parameters: dict[str, Any]
+) -> dict[str, Any]:
+    """在保留固定轮数和设备设置的前提下生成一组 XGBoost 候选参数。"""
+
+    parameters = dict(base_parameters)
+    parameters.update(
+        {
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.02, 0.08, log=True
+            ),
+            "max_depth": trial.suggest_int("max_depth", 5, 9),
+            "min_child_weight": trial.suggest_float(
+                "min_child_weight", 2.0, 20.0, log=True
+            ),
+            "subsample": trial.suggest_float("subsample", 0.70, 1.00),
+            "colsample_bytree": trial.suggest_float(
+                "colsample_bytree", 0.70, 1.00
+            ),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 1.0, log=True),
+            "reg_lambda": trial.suggest_float(
+                "reg_lambda", 0.5, 10.0, log=True
+            ),
+            "gamma": trial.suggest_float("gamma", 0.0, 0.5),
+            "max_bin": trial.suggest_categorical("max_bin", [256, 512]),
+        }
+    )
+    return parameters
+
+
+def optimize_parameters(
+    base_parameters: dict[str, Any],
+    features: np.ndarray,
+    target: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+    args: argparse.Namespace,
+) -> optuna.Study:
+    """以三折完整-DOY合并 RMSE 为目标执行 Optuna 搜索。"""
+
+    def objective(trial: optuna.Trial) -> float:
+        parameters = suggest_model_parameters(trial, base_parameters)
+        total_squared_error = 0.0
+        total_rows = 0
+        fold_rmse: list[float] = []
+        fold_best_iterations: list[int] = []
+        for fold_number, (train_indices, validation_indices) in enumerate(
+            folds, start=1
+        ):
+            weights, _ = build_tail_sample_weights(
+                target[train_indices], args.tail_quantile, args.tail_weight
+            )
+            model = fit_model(
+                parameters,
+                features[train_indices],
+                target[train_indices],
+                weights,
+                features[validation_indices],
+                target[validation_indices],
+                args.early_stopping_rounds,
+            )
+            predicted = model.predict(features[validation_indices]).astype(np.float32)
+            errors = predicted - target[validation_indices]
+            total_squared_error += float(np.dot(errors, errors))
+            total_rows += len(errors)
+            current_rmse = float(np.sqrt(np.mean(errors * errors)))
+            fold_rmse.append(current_rmse)
+            fold_best_iterations.append(int(getattr(model, "best_iteration", 0)))
+            combined_rmse = float(np.sqrt(total_squared_error / total_rows))
+            trial.report(combined_rmse, step=fold_number)
+            del model, predicted, errors, weights
+            gc.collect()
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        trial.set_user_attr("fold_rmse", fold_rmse)
+        trial.set_user_attr("fold_best_iterations_zero_based", fold_best_iterations)
+        return float(np.sqrt(total_squared_error / total_rows))
+
+    sampler = optuna.samplers.TPESampler(seed=args.optuna_seed)
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=min(5, args.optuna_trials), n_warmup_steps=1
+    )
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name="cosmic_residual_complete_doy_groupkfold",
+    )
+
+    progress_path = args.output_dir / "optuna_trials.csv"
+
+    def save_progress(current_study: optuna.Study, _: optuna.trial.FrozenTrial) -> None:
+        """每个试验结束后保存进度，避免长作业中断时完全丢失记录。"""
+
+        current_study.trials_dataframe().to_csv(
+            progress_path, index=False, encoding="utf-8-sig"
+        )
+
+    timeout_seconds = (
+        None
+        if args.optuna_timeout_minutes <= 0.0
+        else args.optuna_timeout_minutes * 60.0
+    )
+    study.optimize(
+        objective,
+        n_trials=args.optuna_trials,
+        timeout=timeout_seconds,
+        callbacks=[save_progress],
+        gc_after_trial=True,
+        show_progress_bar=False,
+    )
+    if not any(
+        trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials
+    ):
+        raise RuntimeError("Optuna 没有完成任何可用试验")
+    study.trials_dataframe().to_csv(
+        progress_path, index=False, encoding="utf-8-sig"
+    )
+    return study
+
+
 def calculate_metrics(
     true: np.ndarray, predicted: np.ndarray, day_count: int
 ) -> SplitMetrics:
@@ -719,6 +859,33 @@ def plot_importance(importance: pd.DataFrame, output: Path, dpi: int) -> None:
     plt.close(figure)
 
 
+def plot_optuna_history(study: optuna.Study, output: Path, dpi: int) -> None:
+    """绘制已完成 Optuna 试验的交叉验证 RMSE 和历次最优值。"""
+
+    completed = [
+        trial
+        for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
+    ]
+    if not completed:
+        return
+    numbers = np.array([trial.number for trial in completed], dtype=int)
+    values = np.array([trial.value for trial in completed], dtype=float)
+    running_best = np.minimum.accumulate(values)
+    figure, axis = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    axis.scatter(numbers, values, s=28, alpha=0.75, label="Completed trial")
+    axis.plot(numbers, running_best, color="red", linewidth=1.5, label="Best so far")
+    axis.set(
+        xlabel="Optuna trial",
+        ylabel="Three-fold OOF RMSE (TECU)",
+        title="Optuna optimization history",
+    )
+    axis.grid(alpha=0.25)
+    axis.legend()
+    figure.savefig(output, dpi=dpi)
+    plt.close(figure)
+
+
 def json_ready(value: Any) -> Any:
     """把 NumPy/Path 类型转换为 JSON 可序列化值。"""
 
@@ -734,123 +901,257 @@ def json_ready(value: Any) -> Any:
 
 
 def main() -> None:
-    """执行数据读取、完整 DOY 划分、训练、评价和结果导出。"""
+    """生成滞后特征，执行 Optuna+GroupKFold，训练最终模型并导出结果。"""
 
     args = parse_args()
     validate_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     files = discover_files(args.input_dir, args.year)
+    omni = load_omni_lag_source(args.omni_file, args.year)
     print(f"发现 {len(files)} 个年积日文件", flush=True)
+    print(f"OMNI 滞后数据：{args.omni_file}", flush=True)
     print(f"目标：{TARGET_COLUMN}", flush=True)
     print(f"特征（不含目标）：{', '.join(FEATURE_COLUMNS)}", flush=True)
-    data, daily = load_data(files, args.max_rows_per_day, args.sampling_seed)
+    data, daily = load_data(
+        files, omni, args.max_rows_per_day, args.sampling_seed
+    )
 
     ratios = np.array(
         [args.train_ratio, args.validation_ratio, args.test_ratio], dtype=float
     )
-    split_indices, day_assignments = split_complete_doys(
+    initial_indices, day_assignments = split_complete_doys(
         data, daily, ratios, args.split_seed
+    )
+    # 原训练集和验证集合并为开发集；原测试 DOY 保持不变并全程隔离。
+    development_indices = np.sort(
+        np.concatenate([initial_indices["train"], initial_indices["validation"]])
+    )
+    test_indices = initial_indices["test"]
+    folds, validation_fold_by_day = make_group_kfold_indices(
+        data, development_indices, args.cv_folds
+    )
+    day_assignments["outer_split"] = np.where(
+        day_assignments["split"].eq("test"), "test", "development"
+    )
+    day_assignments["cv_validation_fold"] = (
+        day_assignments["doy"].map(validation_fold_by_day).astype("Int64")
     )
     day_assignments.to_csv(
         args.output_dir / "doy_split_assignments.csv", index=False, encoding="utf-8-sig"
     )
-
-    # 明确验证每个 DOY 只出现一次，作为防泄漏的硬约束。
     if day_assignments["doy"].duplicated().any():
         raise RuntimeError("DOY 划分表存在重复日期")
-    for split in SPLIT_ORDER:
-        indices = split_indices[split]
-        split_days = day_assignments.loc[day_assignments["split"].eq(split), "doy"]
+
+    development_days = np.unique(data.iloc[development_indices]["source_doy"])
+    test_days = np.unique(data.iloc[test_indices]["source_doy"])
+    print(
+        f"开发集：{len(development_days)} 天，{len(development_indices):,} 行；"
+        f"独立测试集：{len(test_days)} 天，{len(test_indices):,} 行",
+        flush=True,
+    )
+    for fold_number, (train_indices, validation_indices) in enumerate(folds, start=1):
         print(
-            f"{split}: {len(split_days)} 天，{len(indices):,} 行，"
-            f"DOY 范围 {split_days.min():03d}–{split_days.max():03d}",
+            f"CV fold {fold_number}: 训练 "
+            f"{data.iloc[train_indices]['source_doy'].nunique()} 天/{len(train_indices):,} 行，"
+            f"验证 {data.iloc[validation_indices]['source_doy'].nunique()} 天/"
+            f"{len(validation_indices):,} 行",
             flush=True,
         )
 
     features = data[FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=True)
     target = data[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
-    matrices = {
-        split: features[indices] for split, indices in split_indices.items()
-    }
-    targets = {split: target[indices] for split, indices in split_indices.items()}
-    train_sample_weight, tail_weighting = build_tail_sample_weights(
-        targets["train"], args.tail_quantile, args.tail_weight
-    )
-
-    params = model_parameters(args)
+    base_parameters = model_parameters(args)
     print(
-        f"开始训练：最多 {args.n_estimators} 轮，早停 {args.early_stopping_rounds} 轮，"
-        f"L1={args.reg_alpha:g}，L2={args.reg_lambda:g}",
+        f"开始 Optuna：{args.optuna_trials} 次试验，每次 {args.cv_folds} 折，"
+        f"每折最多 {args.n_estimators} 轮、早停 {args.early_stopping_rounds} 轮",
         flush=True,
     )
-    print(
-        "训练集两端加权："
-        f"residual <= {tail_weighting['lower_threshold']:.4f} 或 "
-        f">= {tail_weighting['upper_threshold']:.4f} 时权重="
-        f"{tail_weighting['tail_weight']:g}，共 "
-        f"{tail_weighting['total_tail_rows']:,} 行 "
-        f"({tail_weighting['total_tail_fraction']:.1%})",
-        flush=True,
-    )
-    model = fit_model(
-        params,
-        matrices["train"],
-        targets["train"],
-        train_sample_weight,
-        matrices["validation"],
-        targets["validation"],
-        args.early_stopping_rounds,
-    )
-    model.save_model(args.output_dir / "xg_cosmic_residual_model.json")
-
-    predictions = {
-        split: model.predict(matrices[split]).astype(np.float32)
-        for split in SPLIT_ORDER
-    }
-    metrics: dict[str, SplitMetrics] = {}
-    prediction_frames: list[pd.DataFrame] = []
-    for split in SPLIT_ORDER:
-        indices = split_indices[split]
-        day_count = int(day_assignments["split"].eq(split).sum())
-        metrics[split] = calculate_metrics(
-            targets[split], predictions[split], day_count
-        )
-        prediction_frames.append(
-            pd.DataFrame(
-                {
-                    "split": split,
-                    "source_doy": data.iloc[indices]["source_doy"].to_numpy(),
-                    "source_row": data.iloc[indices]["source_row"].to_numpy(),
-                    "true_residual": targets[split],
-                    "predicted_residual": predictions[split],
-                    "prediction_error": predictions[split] - targets[split],
-                }
+    study = optimize_parameters(base_parameters, features, target, folds, args)
+    best_parameters = dict(base_parameters)
+    best_parameters.update(study.best_trial.params)
+    optuna_summary = {
+        "best_trial_number": int(study.best_trial.number),
+        "best_complete_doy_cv_rmse": float(study.best_value),
+        "best_searched_parameters": study.best_trial.params,
+        "completed_trials": int(
+            sum(
+                trial.state == optuna.trial.TrialState.COMPLETE
+                for trial in study.trials
             )
+        ),
+        "pruned_trials": int(
+            sum(
+                trial.state == optuna.trial.TrialState.PRUNED
+                for trial in study.trials
+            )
+        ),
+    }
+    (args.output_dir / "optuna_best_params.json").write_text(
+        json.dumps(optuna_summary, ensure_ascii=False, indent=2, default=json_ready),
+        encoding="utf-8",
+    )
+    try:
+        parameter_importance = optuna.importance.get_param_importances(study)
+        pd.DataFrame(
+            parameter_importance.items(), columns=["parameter", "importance"]
+        ).to_csv(
+            args.output_dir / "optuna_parameter_importance.csv",
+            index=False,
+            encoding="utf-8-sig",
         )
-        result = metrics[split]
+    except (RuntimeError, ValueError):
+        parameter_importance = {}
+    plot_optuna_history(study, args.output_dir / "optuna_history.png", args.dpi)
+    print(
+        f"Optuna 最优试验 {study.best_trial.number}："
+        f"三折合并 RMSE={study.best_value:.4f}",
+        flush=True,
+    )
+    print(
+        "最优搜索参数："
+        + ", ".join(f"{key}={value}" for key, value in study.best_trial.params.items()),
+        flush=True,
+    )
+
+    # 用最优参数重跑三折，得到完整 OOF 预测、学习曲线和稳健的轮次估计。
+    oof_predictions = np.full(len(data), np.nan, dtype=np.float32)
+    fold_histories: list[dict[str, dict[str, list[float]]]] = []
+    fold_best_iterations: list[int] = []
+    fold_metric_rows: list[dict[str, Any]] = []
+    fold_tail_weighting: list[dict[str, Any]] = []
+    for fold_number, (train_indices, validation_indices) in enumerate(folds, start=1):
+        weights, weighting_summary = build_tail_sample_weights(
+            target[train_indices], args.tail_quantile, args.tail_weight
+        )
+        model = fit_model(
+            best_parameters,
+            features[train_indices],
+            target[train_indices],
+            weights,
+            features[validation_indices],
+            target[validation_indices],
+            args.early_stopping_rounds,
+        )
+        predicted = model.predict(features[validation_indices]).astype(np.float32)
+        oof_predictions[validation_indices] = predicted
+        validation_days = int(data.iloc[validation_indices]["source_doy"].nunique())
+        fold_metrics = calculate_metrics(
+            target[validation_indices], predicted, validation_days
+        )
+        best_iteration = int(getattr(model, "best_iteration", 0))
+        fold_best_iterations.append(best_iteration)
+        fold_histories.append(model.evals_result())
+        weighting_summary = {"fold": fold_number, **weighting_summary}
+        fold_tail_weighting.append(weighting_summary)
+        fold_metric_rows.append(
+            {
+                "fold": fold_number,
+                "train_rows": len(train_indices),
+                "train_days": int(data.iloc[train_indices]["source_doy"].nunique()),
+                "validation_rows": len(validation_indices),
+                "validation_days": validation_days,
+                "best_iteration_zero_based": best_iteration,
+                "best_score": float(getattr(model, "best_score", np.nan)),
+                "rmse": fold_metrics.rmse,
+                "mae": fold_metrics.mae,
+                "r2": fold_metrics.r2,
+                "bias": fold_metrics.bias,
+                "correlation": fold_metrics.correlation,
+            }
+        )
         print(
-            f"{split}: RMSE={result.rmse:.4f}, MAE={result.mae:.4f}, "
+            f"最优参数 fold {fold_number}: RMSE={fold_metrics.rmse:.4f}, "
+            f"R2={fold_metrics.r2:.4f}, best_round={best_iteration + 1}",
+            flush=True,
+        )
+        del model, predicted, weights
+        gc.collect()
+
+    if not np.isfinite(oof_predictions[development_indices]).all():
+        raise RuntimeError("开发集 OOF 预测不完整")
+    selected_n_estimators = int(
+        np.clip(
+            np.rint(np.median(np.asarray(fold_best_iterations) + 1)),
+            1,
+            args.n_estimators,
+        )
+    )
+    final_weights, final_tail_weighting = build_tail_sample_weights(
+        target[development_indices], args.tail_quantile, args.tail_weight
+    )
+    final_parameters = dict(best_parameters)
+    final_parameters["n_estimators"] = selected_n_estimators
+    print(
+        f"三折最佳轮数：{[value + 1 for value in fold_best_iterations]}；"
+        f"最终模型使用中位数 {selected_n_estimators} 轮",
+        flush=True,
+    )
+    final_model = xgb.XGBRegressor(**final_parameters)
+    final_model.fit(
+        features[development_indices],
+        target[development_indices],
+        sample_weight=final_weights,
+        verbose=False,
+    )
+    final_model.save_model(args.output_dir / "xg_cosmic_residual_model.json")
+    test_predictions = final_model.predict(features[test_indices]).astype(np.float32)
+
+    metrics = {
+        "development_oof": calculate_metrics(
+            target[development_indices],
+            oof_predictions[development_indices],
+            len(development_days),
+        ),
+        "test": calculate_metrics(
+            target[test_indices], test_predictions, len(test_days)
+        ),
+    }
+    for split_name, result in metrics.items():
+        print(
+            f"{split_name}: RMSE={result.rmse:.4f}, MAE={result.mae:.4f}, "
             f"R2={result.r2:.4f}, bias={result.bias:.4f}",
             flush=True,
         )
 
-    metric_frame = pd.DataFrame(
-        [{"split": split, **asdict(metrics[split])} for split in SPLIT_ORDER]
+    development_frame = pd.DataFrame(
+        {
+            "split": "development_oof",
+            "source_doy": data.iloc[development_indices]["source_doy"].to_numpy(),
+            "source_row": data.iloc[development_indices]["source_row"].to_numpy(),
+            "true_residual": target[development_indices],
+            "predicted_residual": oof_predictions[development_indices],
+            "prediction_error": (
+                oof_predictions[development_indices] - target[development_indices]
+            ),
+        }
     )
-    metric_frame.to_csv(
+    test_frame = pd.DataFrame(
+        {
+            "split": "test",
+            "source_doy": data.iloc[test_indices]["source_doy"].to_numpy(),
+            "source_row": data.iloc[test_indices]["source_row"].to_numpy(),
+            "true_residual": target[test_indices],
+            "predicted_residual": test_predictions,
+            "prediction_error": test_predictions - target[test_indices],
+        }
+    )
+    pd.DataFrame(
+        [{"split": split_name, **asdict(value)} for split_name, value in metrics.items()]
+    ).to_csv(
         args.output_dir / "split_metrics.csv", index=False, encoding="utf-8-sig"
     )
-    all_predictions = pd.concat(prediction_frames, ignore_index=True)
-    all_predictions.to_csv(
+    pd.concat([development_frame, test_frame], ignore_index=True).to_csv(
         args.output_dir / "all_split_predictions.csv",
         index=False,
         encoding="utf-8-sig",
         float_format="%.8g",
     )
+    pd.DataFrame(fold_metric_rows).to_csv(
+        args.output_dir / "cv_fold_metrics.csv", index=False, encoding="utf-8-sig"
+    )
 
     daily_test = (
-        prediction_frames[2]
-        .assign(squared_error=lambda frame: frame["prediction_error"] ** 2)
+        test_frame.assign(squared_error=lambda frame: frame["prediction_error"] ** 2)
         .groupby("source_doy", as_index=False)
         .agg(
             rows=("true_residual", "size"),
@@ -866,33 +1167,51 @@ def main() -> None:
         args.output_dir / "test_daily_metrics.csv", index=False, encoding="utf-8-sig"
     )
 
-    importance = feature_importance(model)
+    importance = feature_importance(final_model)
     importance.to_csv(
         args.output_dir / "feature_importance.csv", index=False, encoding="utf-8-sig"
     )
-    history = model.evals_result()
-    history_frame = pd.DataFrame(
-        {
-            "round": np.arange(len(history["validation_0"]["rmse"])),
-            "train_rmse": history["validation_0"]["rmse"],
-            "validation_rmse": history["validation_1"]["rmse"],
-        }
-    )
-    history_frame.to_csv(
+    learning_frames = []
+    for fold_number, (history, best_iteration) in enumerate(
+        zip(fold_histories, fold_best_iterations), start=1
+    ):
+        rounds = len(history["validation_0"]["rmse"])
+        learning_frames.append(
+            pd.DataFrame(
+                {
+                    "fold": fold_number,
+                    "round": np.arange(rounds),
+                    "train_rmse": history["validation_0"]["rmse"],
+                    "validation_rmse": history["validation_1"]["rmse"],
+                    "best_iteration_zero_based": best_iteration,
+                }
+            )
+        )
+    pd.concat(learning_frames, ignore_index=True).to_csv(
         args.output_dir / "learning_curve.csv", index=False, encoding="utf-8-sig"
     )
 
-    plot_learning_curve(model, args.output_dir / "learning_curve.png", args.dpi)
+    plot_learning_curve(
+        fold_histories,
+        fold_best_iterations,
+        args.output_dir / "learning_curve.png",
+        args.dpi,
+    )
     plot_test_scatter(
-        targets["test"],
-        predictions["test"],
+        target[test_indices],
+        test_predictions,
         args.output_dir / "test_true_vs_predicted.png",
         args.max_plot_points,
         args.model_seed,
         args.dpi,
     )
     plot_target_distribution(
-        targets, args.output_dir / "target_distribution_by_split.png", args.dpi
+        {
+            "development": target[development_indices],
+            "test": target[test_indices],
+        },
+        args.output_dir / "target_distribution_by_split.png",
+        args.dpi,
     )
     plot_importance(
         importance, args.output_dir / "feature_importance.png", args.dpi
@@ -901,23 +1220,34 @@ def main() -> None:
     run_metadata = {
         "target": TARGET_COLUMN,
         "features": FEATURE_COLUMNS,
+        "lag_features": LAG_FEATURE_SPECS,
+        "omni_file": args.omni_file,
         "target_leakage_prevention": "residual excluded from features",
-        "split_unit": "complete source DOY",
-        "split_ratios": dict(zip(SPLIT_ORDER, ratios.tolist())),
+        "outer_test_policy": "original complete-DOY test split kept fully isolated",
+        "cross_validation": {
+            "method": "GroupKFold",
+            "group": "source_doy",
+            "n_splits": args.cv_folds,
+            "fold_metrics": fold_metric_rows,
+            "selected_n_estimators_from_median_best_round": selected_n_estimators,
+        },
+        "initial_split_ratios": dict(zip(SPLIT_ORDER, ratios.tolist())),
         "split_seed": args.split_seed,
         "model_seed": args.model_seed,
         "sampling_seed": args.sampling_seed,
-        "model_parameters": params,
-        "tail_weighting": tail_weighting,
-        "best_iteration_zero_based": getattr(model, "best_iteration", None),
-        "best_score": getattr(model, "best_score", None),
-        "metrics": {split: asdict(value) for split, value in metrics.items()},
+        "optuna": {**optuna_summary, "parameter_importance": parameter_importance},
+        "base_model_parameters": base_parameters,
+        "final_model_parameters": final_parameters,
+        "fold_tail_weighting": fold_tail_weighting,
+        "final_tail_weighting": final_tail_weighting,
+        "metrics": {name: asdict(value) for name, value in metrics.items()},
         "arguments": vars(args),
         "library_versions": {
             "python": sys.version,
             "numpy": np.__version__,
             "pandas": pd.__version__,
             "xgboost": xgb.__version__,
+            "optuna": optuna.__version__,
         },
     }
     (args.output_dir / "run_metadata.json").write_text(

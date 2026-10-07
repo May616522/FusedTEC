@@ -4,15 +4,15 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --chdir=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021
 #SBATCH --output=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021/xg_cosmic_residual_%j.out
 #SBATCH --error=/share/home/u23114/tj23114/packages/yaoyaping/cosmic2021/xg_cosmic_residual_%j.err
 
 # COSMIC residual 的 XGBoost Slurm 作业脚本。
-# 按完整年积日随机划分 70%/20%/10%，同一 DOY 不会进入多个集合。
-# 默认使用全部有效行，最多训练 500 轮并使用验证集早停，同时启用 L1/L2、
-# 行采样和列采样。训练集 residual 最低和最高各 10% 的样本使用更高权重。
+# 保留 10% 完整 DOY 作为独立测试集，其余日期执行 3 折 GroupKFold。
+# Optuna 自动搜索 XGBoost 参数，每折最多 500 轮并使用 early stopping。
+# Kp/Dst 滞后特征由逐小时 OMNI 文件生成，不使用未来数据。
 
 set -euo pipefail
 
@@ -23,14 +23,19 @@ PYTHON_SCRIPT="${SCRIPT_DIR}/xg_cosmic_residual.py"
 # 如环境不同，仍可在提交作业时用同名环境变量覆盖下面三个路径。
 PYTHON_BIN="${PYTHON_BIN:-/share/home/u23114/tj23114/miniconda3/envs/LiuQingyuan/bin/python}"
 INPUT_DIR="${INPUT_DIR:-/share/home/u23114/tj23114/data/Yaoyaping_data/cosmic2021}"
+OMNI_FILE="${OMNI_FILE:-/share/home/u23114/tj23114/data/Yaoyaping_data/Other/omni2_2021.dat.csv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/xg_cosmic_results}"
 
-EXPERIMENT_NAME="random_complete_doy_7_2_1_regularized_500rounds_tailweighted"
+EXPERIMENT_NAME="complete_doy_groupkfold3_optuna_lag_500rounds"
 RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_NAME}/${RUN_ID}"
 
 N_ESTIMATORS="500"
 EARLY_STOPPING_ROUNDS="30"
+CV_FOLDS="3"
+OPTUNA_TRIALS="30"
+OPTUNA_TIMEOUT_MINUTES="0"
+OPTUNA_SEED="42"
 TAIL_QUANTILE="0.10"
 TAIL_WEIGHT="2.0"
 LEARNING_RATE="0.05"
@@ -60,6 +65,10 @@ if [[ ! -d "${INPUT_DIR}" ]]; then
     echo "ERROR: input directory does not exist: ${INPUT_DIR}" >&2
     exit 2
 fi
+if [[ ! -f "${OMNI_FILE}" ]]; then
+    echo "ERROR: OMNI CSV is missing: ${OMNI_FILE}" >&2
+    exit 2
+fi
 if [[ ! -f "${INPUT_DIR}/cosmic2_model_2021_001.csv" ]]; then
     echo "ERROR: first daily CSV is missing: ${INPUT_DIR}/cosmic2_model_2021_001.csv" >&2
     exit 2
@@ -79,8 +88,8 @@ shopt -u nullglob
 
 mkdir -p "${OUTPUT_DIR}"
 
-if ! "${PYTHON_BIN}" -c "import matplotlib,numpy,pandas,sklearn,xgboost"; then
-    echo "ERROR: missing Python packages: numpy pandas matplotlib scikit-learn xgboost" >&2
+if ! "${PYTHON_BIN}" -c "import matplotlib,numpy,optuna,pandas,sklearn,xgboost"; then
+    echo "ERROR: missing Python packages: numpy pandas matplotlib scikit-learn xgboost optuna" >&2
     exit 3
 fi
 
@@ -92,9 +101,11 @@ echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Python script: ${PYTHON_SCRIPT}"
 echo "Python executable: ${PYTHON_BIN}"
 echo "Input: ${INPUT_DIR}"
+echo "OMNI: ${OMNI_FILE}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Daily CSV files: ${#CSV_FILES[@]}"
-echo "Split: complete DOY random 70%/20%/10%, seed=${SPLIT_SEED}"
+echo "Split: isolated 10% complete-DOY test; remaining DOYs use ${CV_FOLDS}-fold GroupKFold"
+echo "Optuna: trials=${OPTUNA_TRIALS}, timeout_minutes=${OPTUNA_TIMEOUT_MINUTES}, seed=${OPTUNA_SEED}"
 echo "Target: residual (excluded from model features to prevent leakage)"
 echo "Boosting: max ${N_ESTIMATORS}, early stopping ${EARLY_STOPPING_ROUNDS}"
 echo "Tail weighting: lower/upper ${TAIL_QUANTILE} quantiles, weight=${TAIL_WEIGHT}"
@@ -103,11 +114,16 @@ echo "Sampling: max rows per DOY=${MAX_ROWS_PER_DAY}; 0 means all rows"
 
 COMMAND=("${PYTHON_BIN}" -u "${PYTHON_SCRIPT}"
     --input-dir "${INPUT_DIR}"
+    --omni-file "${OMNI_FILE}"
     --output-dir "${OUTPUT_DIR}"
     --year 2021
     --train-ratio 0.70
     --validation-ratio 0.20
     --test-ratio 0.10
+    --cv-folds "${CV_FOLDS}"
+    --optuna-trials "${OPTUNA_TRIALS}"
+    --optuna-timeout-minutes "${OPTUNA_TIMEOUT_MINUTES}"
+    --optuna-seed "${OPTUNA_SEED}"
     --split-seed "${SPLIT_SEED}"
     --model-seed "${MODEL_SEED}"
     --sampling-seed "${SAMPLING_SEED}"

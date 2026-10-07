@@ -1,0 +1,5 @@
+numpy
+netCDF4
+matplotlib
+torch>=2.1
+
